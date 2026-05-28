@@ -75,9 +75,22 @@ jobs:
           echo "VPX_VERSION=$vpxVersion"    | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           echo "VPX_NO_PKG_CONFIG=1"        | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           echo "VPX_STATIC=1"               | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # bindgen wants LIBCLANG_PATH — Visual Studio ships clang/llvm
-          $llvm = (Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "libclang.dll" -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName
-          if ($llvm) { echo "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          # bindgen wants LIBCLANG_PATH — Visual Studio ships clang/llvm in
+          # both ARM64 and x64 variants under VC\Tools\Llvm\*. We need the x64
+          # one for an x64 build; the recursive search would otherwise pick
+          # whichever it finds first (often ARM64) and bindgen rejects it as
+          # "invalid DLL (ARM64)". Filter explicitly for x64.
+          $candidates = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "libclang.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\Llvm\\(x64|bin)\\' } |
+            Select-Object -First 1
+          $llvm = $candidates.DirectoryName
+          if (-not $llvm) {
+            # Fall back to chocolatey LLVM if VS didn't include x64 libclang
+            choco install llvm --no-progress -y
+            $llvm = "C:\Program Files\LLVM\bin"
+          }
+          echo "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Using LIBCLANG_PATH=$llvm"
 
       - name: Build (release)
         run: cargo build --release
