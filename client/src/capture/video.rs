@@ -36,17 +36,6 @@ impl VideoCapture {
             }
         }
 
-        let opts = Options {
-            fps: target_fps,
-            show_cursor: true,
-            show_highlight: false,
-            output_type: scap::frame::FrameType::BGRAFrame,
-            output_resolution: Resolution::_1080p,
-            ..Default::default()
-        };
-        let mut capturer = Capturer::new(opts);
-        capturer.start_capture();
-
         let (tx, rx) = mpsc::channel::<VideoFrame>(8);
 
         // Latest valid frame, shared between the scap reader thread (writer)
@@ -57,7 +46,22 @@ impl VideoCapture {
         let latest: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
 
         let latest_writer = latest.clone();
+        let reader_fps = target_fps;
         let reader = thread::spawn(move || {
+            // Build the Capturer inside the thread. On Windows, scap's
+            // Options contains Option<Target> where Target::Window holds an
+            // HWND(*mut c_void) — making Options unconditionally !Send.
+            // Constructing here keeps the !Send value confined to one thread.
+            let opts = Options {
+                fps: reader_fps,
+                show_cursor: true,
+                show_highlight: false,
+                output_type: scap::frame::FrameType::BGRAFrame,
+                output_resolution: Resolution::_1080p,
+                ..Default::default()
+            };
+            let mut capturer = Capturer::new(opts);
+            capturer.start_capture();
             let start = Instant::now();
             let mut first_logged = false;
             let mut empties_in_a_row = 0u32;
