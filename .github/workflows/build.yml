@@ -1,0 +1,87 @@
+name: build client
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-x64
+            os: macos-13
+            ext: ""
+          - label: macos-arm64
+            os: macos-14
+            ext: ""
+          - label: windows-x64
+            os: windows-latest
+            ext: ".exe"
+
+    defaults:
+      run:
+        working-directory: client
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            client/target
+          key: ${{ runner.os }}-${{ matrix.label }}-cargo-${{ hashFiles('client/Cargo.lock', 'client/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.label }}-cargo-
+
+      # ---------- macOS deps ----------
+      - name: Install libvpx (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libvpx pkg-config
+
+      # ---------- Windows deps ----------
+      # libvpx via vcpkg, then point env-libvpx-sys at it without pkg-config.
+      # bindgen (generate feature) needs libclang — bundled with the runner image.
+      - name: Install libvpx (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install libvpx:x64-windows
+          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
+          echo "VPX_LIB_DIR=$vcpkg/lib"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "VPX_INCLUDE_DIR=$vcpkg/include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "VPX_NO_PKG_CONFIG=1"        | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "VPX_STATIC=1"               | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # bindgen wants LIBCLANG_PATH — Visual Studio ships clang/llvm
+          $llvm = (Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "libclang.dll" -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName
+          if ($llvm) { echo "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          # opus (audiopus_sys) needs cmake — preinstalled on windows-latest
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "target/release/screenshare${{ matrix.ext }}" "out/screenshare-${{ matrix.label }}${{ matrix.ext }}"
+          ls -lh out/
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshare-${{ matrix.label }}
+          path: client/out/screenshare-${{ matrix.label }}${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 14

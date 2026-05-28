@@ -12,7 +12,7 @@ use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
@@ -161,36 +161,35 @@ where
         }
     }
 
-    // Keep alive until pumps exit or pc closes
     let _ = video_pump_handle.await;
     let _ = audio_pump_handle.await;
     Ok(())
 }
 
-/// Spawns the screen capture + VP8 encoder. Returns a join handle and a tap that
-/// also receives every encoded frame for the fallback WS relay.
+/// Spawns screen capture + VP8 encode on a dedicated OS thread (libvpx's
+/// `Encoder` is `!Send` so we can't hold it across `.await`), then drains the
+/// encoded packets in an async task to call `track.write_sample()` and to
+/// broadcast for the fallback path.
 fn start_video_pump(
     track: Arc<TrackLocalStaticSample>,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::broadcast::Receiver<EncodedFrame>)> {
     let mut capture = VideoCapture::start(30)?;
     let (bcast_tx, bcast_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(16);
+    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::unbounded_channel::<EncodedFrame>();
 
-    let handle = tokio::spawn(async move {
-        // Lazily build the encoder once we know the actual capture dimensions
-        // (scap may downscale based on Resolution hint).
+    std::thread::spawn(move || {
         let mut encoder: Option<vpx_encode::Encoder> = None;
         let mut enc_w = 0u32;
         let mut enc_h = 0u32;
         let mut t0_us: Option<u64> = None;
 
-        while let Some(frame) = capture.rx.recv().await {
-            // (Re)build encoder on resolution change
+        while let Some(frame) = capture.rx.blocking_recv() {
             if encoder.is_none() || enc_w != frame.width || enc_h != frame.height {
                 let cfg = vpx_encode::Config {
                     width: frame.width,
                     height: frame.height,
-                    timebase: [1, 1000], // ms timebase
-                    bitrate: 4_000,       // kbps
+                    timebase: [1, 1000],
+                    bitrate: 4_000,
                     codec: vpx_encode::VideoCodecId::VP8,
                 };
                 match vpx_encode::Encoder::new(cfg) {
@@ -224,40 +223,48 @@ fn start_video_pump(
                 }
             };
             for pkt in packets {
-                let data = pkt.data.to_vec();
-                let keyframe = pkt.key;
-                let duration = Duration::from_micros(33_333);
-                let sample = webrtc::media::Sample {
-                    data: data.clone().into(),
-                    duration,
-                    ..Default::default()
-                };
-                if let Err(e) = track.write_sample(&sample).await {
-                    tracing::warn!("track write failed: {e}");
-                }
-                let _ = bcast_tx.send(EncodedFrame {
+                let ef = EncodedFrame {
                     stream: 0,
-                    keyframe,
+                    keyframe: pkt.key,
                     timestamp_us: frame.timestamp_us,
-                    data,
-                });
+                    data: pkt.data.to_vec(),
+                };
+                if enc_tx.send(ef).is_err() {
+                    return;
+                }
             }
+        }
+    });
+
+    let handle = tokio::spawn(async move {
+        while let Some(ef) = enc_rx.recv().await {
+            let sample = webrtc::media::Sample {
+                data: ef.data.clone().into(),
+                duration: Duration::from_micros(33_333),
+                ..Default::default()
+            };
+            if let Err(e) = track.write_sample(&sample).await {
+                tracing::warn!("video track write failed: {e}");
+            }
+            let _ = bcast_tx.send(ef);
         }
     });
 
     Ok((handle, bcast_rx))
 }
 
+/// Same pattern for audio: opus::Encoder is `!Send`, so the encode loop runs
+/// on an OS thread and forwards EncodedFrames to an async forwarder.
 fn start_audio_pump(
     track: Arc<TrackLocalStaticSample>,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::broadcast::Receiver<EncodedFrame>)> {
     let mut capture = AudioCapture::start()?;
     let (bcast_tx, bcast_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(64);
+    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::unbounded_channel::<EncodedFrame>();
     let channels = capture.channels as usize;
     let sample_rate = capture.sample_rate;
 
-    let handle = tokio::spawn(async move {
-        // Opus encoder: enforce 48 kHz stereo for compatibility with browser default.
+    std::thread::spawn(move || {
         let mut encoder = match opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio) {
             Ok(e) => e,
             Err(e) => {
@@ -265,37 +272,28 @@ fn start_audio_pump(
                 return;
             }
         };
-        let mut buf: Vec<f32> = Vec::with_capacity(48_000); // 1s of stereo
-        // Frame size for 20ms @ 48kHz stereo = 960 samples/ch * 2 = 1920 interleaved
-        const FRAME_SAMPLES: usize = 960;
+        const FRAME_SAMPLES: usize = 960; // 20ms @ 48kHz per channel
+        let mut buf: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * 2 * 4);
         let mut out = vec![0u8; 4000];
+        let mut warned = false;
 
-        while let Some(frame) = capture.rx.recv().await {
-            // Resample/upmix as needed (very simple: assume rate==48000 stereo; otherwise warn)
-            if sample_rate != 48_000 || channels != 2 {
-                if buf.is_empty() {
-                    tracing::warn!(
-                        sample_rate, channels,
-                        "audio not 48kHz stereo — frames will be passed through without resampling; quality may suffer"
-                    );
-                }
-                // Simple stereo upmix from mono if needed
-                let stereo: Vec<f32> = if channels == 1 {
-                    let mut v = Vec::with_capacity(frame.samples.len() * 2);
-                    for s in frame.samples {
-                        v.push(s);
-                        v.push(s);
-                    }
-                    v
-                } else {
-                    frame.samples
-                };
-                buf.extend_from_slice(&stereo);
-            } else {
-                buf.extend_from_slice(&frame.samples);
+        while let Some(frame) = capture.rx.blocking_recv() {
+            if (sample_rate != 48_000 || channels != 2) && !warned {
+                tracing::warn!(sample_rate, channels, "audio not 48kHz stereo; quality may suffer");
+                warned = true;
             }
+            let stereo: Vec<f32> = if channels == 1 {
+                let mut v = Vec::with_capacity(frame.samples.len() * 2);
+                for s in frame.samples {
+                    v.push(s);
+                    v.push(s);
+                }
+                v
+            } else {
+                frame.samples
+            };
+            buf.extend_from_slice(&stereo);
 
-            // Drain in 20ms stereo chunks
             while buf.len() >= FRAME_SAMPLES * 2 {
                 let chunk: Vec<f32> = buf.drain(..FRAME_SAMPLES * 2).collect();
                 let n = match encoder.encode_float(&chunk, &mut out) {
@@ -305,22 +303,30 @@ fn start_audio_pump(
                         continue;
                     }
                 };
-                let data = out[..n].to_vec();
-                let sample = webrtc::media::Sample {
-                    data: data.clone().into(),
-                    duration: Duration::from_millis(20),
-                    ..Default::default()
-                };
-                if let Err(e) = track.write_sample(&sample).await {
-                    tracing::warn!("audio track write failed: {e}");
-                }
-                let _ = bcast_tx.send(EncodedFrame {
+                let ef = EncodedFrame {
                     stream: 1,
                     keyframe: false,
                     timestamp_us: frame.timestamp_us,
-                    data,
-                });
+                    data: out[..n].to_vec(),
+                };
+                if enc_tx.send(ef).is_err() {
+                    return;
+                }
             }
+        }
+    });
+
+    let handle = tokio::spawn(async move {
+        while let Some(ef) = enc_rx.recv().await {
+            let sample = webrtc::media::Sample {
+                data: ef.data.clone().into(),
+                duration: Duration::from_millis(20),
+                ..Default::default()
+            };
+            if let Err(e) = track.write_sample(&sample).await {
+                tracing::warn!("audio track write failed: {e}");
+            }
+            let _ = bcast_tx.send(ef);
         }
     });
 
