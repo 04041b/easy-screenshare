@@ -47,6 +47,7 @@ impl VideoCapture {
 
         let join = thread::spawn(move || {
             let start = std::time::Instant::now();
+            let mut first_logged = false;
             loop {
                 let frame = match capturer.get_next_frame() {
                     Ok(f) => f,
@@ -57,13 +58,22 @@ impl VideoCapture {
                 };
                 let ts_us = start.elapsed().as_micros() as u64;
                 let parsed = match frame {
-                    Frame::BGRA(b) => Some(VideoFrame {
-                        width: b.width as u32,
-                        height: b.height as u32,
-                        stride: (b.width as u32) * 4,
-                        data: b.data,
-                        timestamp_us: ts_us,
-                    }),
+                    Frame::BGRA(b) => {
+                        if !first_logged {
+                            tracing::info!(
+                                w = b.width, h = b.height, bytes = b.data.len(),
+                                "first BGRA frame from scap"
+                            );
+                            first_logged = true;
+                        }
+                        Some(VideoFrame {
+                            width: b.width as u32,
+                            height: b.height as u32,
+                            stride: (b.width as u32) * 4,
+                            data: b.data,
+                            timestamp_us: ts_us,
+                        })
+                    }
                     other => {
                         tracing::warn!("unexpected frame type: {:?}", std::mem::discriminant(&other));
                         None

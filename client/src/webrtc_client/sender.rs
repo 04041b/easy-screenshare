@@ -6,7 +6,9 @@ use tokio::sync::Notify;
 use tokio::time::sleep;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS, MIME_TYPE_VP8};
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::ice::network_type::NetworkType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -46,9 +48,15 @@ where
     media.register_default_codecs()?;
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media)?;
+    let mut settings = SettingEngine::default();
+    // Restrict to IPv4 only — webrtc-rs's IPv6 gather is noisy on macOS (link-local
+    // candidates fail to bind, STUN resolver requires an IPv6 default route) and
+    // adds no useful connectivity for typical home/office networks.
+    settings.set_network_types(vec![NetworkType::Udp4]);
     let api = APIBuilder::new()
         .with_media_engine(media)
         .with_interceptor_registry(registry)
+        .with_setting_engine(settings)
         .build();
 
     let config = RTCConfiguration {
@@ -182,9 +190,25 @@ fn start_video_pump(
         let mut enc_w = 0u32;
         let mut enc_h = 0u32;
         let mut t0_us: Option<u64> = None;
+        let mut frames_seen = 0u64;
 
         while let Some(frame) = capture.rx.blocking_recv() {
+            frames_seen += 1;
+            // VP8 needs even dimensions and non-zero size. scap can deliver
+            // garbage frames before permission is fully granted on macOS —
+            // skip those rather than failing the encoder.
+            if frame.width < 16 || frame.height < 16 || frame.width % 2 != 0 || frame.height % 2 != 0 {
+                if frames_seen < 5 || frames_seen % 30 == 0 {
+                    tracing::warn!(
+                        w = frame.width, h = frame.height, stride = frame.stride,
+                        bytes = frame.data.len(),
+                        "dropping unusable capture frame"
+                    );
+                }
+                continue;
+            }
             if encoder.is_none() || enc_w != frame.width || enc_h != frame.height {
+                tracing::info!(w = frame.width, h = frame.height, "initializing VP8 encoder");
                 let cfg = vpx_encode::Config {
                     width: frame.width,
                     height: frame.height,
@@ -199,7 +223,7 @@ fn start_video_pump(
                         enc_h = frame.height;
                     }
                     Err(e) => {
-                        tracing::error!("vpx encoder init failed: {e}");
+                        tracing::error!(w = frame.width, h = frame.height, "vpx encoder init failed: {e}");
                         return;
                     }
                 }
