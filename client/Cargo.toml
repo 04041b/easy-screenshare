@@ -39,10 +39,11 @@ env-libvpx-sys = { version = "5.1", features = ["generate"] }
 opus = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# scap 0.0.8 declares `windows-capture = "^1.3.6"` but the crate broke its
-# Settings::new signature within the 1.x range (5 args in 1.3.x, 8 in 1.5).
-# Pin to the exact version scap was developed against so Windows builds.
-windows-capture = "=1.3.6"
+# scap 0.0.8's Windows backend straddles two windows-capture API eras:
+# it uses `capture::Context` and `FrameBuffer::as_nopadding_buffer` (added
+# in 1.4) but also calls Settings::new with 5 args (which became 8 in 1.5).
+# 1.4.4 is the last release that has both shapes.
+windows-capture = "=1.4.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # scap already wraps ScreenCaptureKit including system audio on macOS 13+.
