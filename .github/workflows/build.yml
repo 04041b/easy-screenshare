@@ -72,6 +72,16 @@ jobs:
           # which is incompatible with VPX_STATIC=1.
           vcpkg install libvpx:x64-windows-static-md
           $vcpkg = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md"
+          Write-Host "vcpkg lib dir contents:"
+          Get-ChildItem "$vcpkg/lib" | Select-Object Name, Length
+          # vcpkg names the static lib `vpx.lib`, but env-libvpx-sys emits
+          # `cargo:rustc-link-lib=static=libvpx` on Windows (with the `lib`
+          # prefix baked in). Rust's MSVC linker resolver doesn't try the
+          # unprefixed form, so we mirror the file under both names.
+          if (Test-Path "$vcpkg/lib/vpx.lib") {
+            Copy-Item "$vcpkg/lib/vpx.lib" "$vcpkg/lib/libvpx.lib" -Force
+            Write-Host "Mirrored vpx.lib -> libvpx.lib"
+          }
           # Discover what vcpkg actually installed instead of hardcoding.
           $vpxVersion = (vcpkg list libvpx | Select-String -Pattern 'libvpx:x64-windows-static-md\s+(\S+)' | ForEach-Object { $_.Matches.Groups[1].Value }) -replace '#.*',''
           if (-not $vpxVersion) { $vpxVersion = "1.16.0" }
