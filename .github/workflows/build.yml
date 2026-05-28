@@ -65,10 +65,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          vcpkg install libvpx:x64-windows
-          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
+          # x64-windows-static-md = static libvpx.lib compiled against the
+          # dynamic CRT (/MD). Matches Rust's default ABI and lets us produce
+          # a single-binary release with libvpx baked in. The plain
+          # x64-windows triplet would install vpx.dll + an import .lib,
+          # which is incompatible with VPX_STATIC=1.
+          vcpkg install libvpx:x64-windows-static-md
+          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md"
           # Discover what vcpkg actually installed instead of hardcoding.
-          $vpxVersion = (vcpkg list libvpx | Select-String -Pattern 'libvpx:x64-windows\s+(\S+)' | ForEach-Object { $_.Matches.Groups[1].Value }) -replace '#.*',''
+          $vpxVersion = (vcpkg list libvpx | Select-String -Pattern 'libvpx:x64-windows-static-md\s+(\S+)' | ForEach-Object { $_.Matches.Groups[1].Value }) -replace '#.*',''
           if (-not $vpxVersion) { $vpxVersion = "1.16.0" }
           echo "VPX_LIB_DIR=$vcpkg/lib"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           echo "VPX_INCLUDE_DIR=$vcpkg/include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
