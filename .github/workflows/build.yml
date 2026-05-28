@@ -75,17 +75,19 @@ jobs:
           echo "VPX_VERSION=$vpxVersion"    | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           echo "VPX_NO_PKG_CONFIG=1"        | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           echo "VPX_STATIC=1"               | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # bindgen wants LIBCLANG_PATH — Visual Studio ships clang/llvm in
-          # both ARM64 and x64 variants under VC\Tools\Llvm\*. We need the x64
-          # one for an x64 build; the recursive search would otherwise pick
-          # whichever it finds first (often ARM64) and bindgen rejects it as
-          # "invalid DLL (ARM64)". Filter explicitly for x64.
+          # bindgen wants LIBCLANG_PATH. VS 2022 actually ships THREE copies
+          # of libclang.dll under VC\Tools\Llvm\*:
+          #   * \Llvm\bin\libclang.dll       — 32-bit (legacy)
+          #   * \Llvm\x64\bin\libclang.dll   — 64-bit
+          #   * \Llvm\ARM64\bin\libclang.dll — ARM64
+          # We need the x64 one for an x64 build; bindgen rejects the others
+          # with "invalid DLL (ARM64 / 32-bit)". Match the x64 path exactly.
           $candidates = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "libclang.dll" -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\Llvm\\(x64|bin)\\' } |
+            Where-Object { $_.FullName -match '\\Llvm\\x64\\bin\\' } |
             Select-Object -First 1
           $llvm = $candidates.DirectoryName
           if (-not $llvm) {
-            # Fall back to chocolatey LLVM if VS didn't include x64 libclang
+            # Fall back to chocolatey LLVM if VS doesn't ship an x64 libclang
             choco install llvm --no-progress -y
             $llvm = "C:\Program Files\LLVM\bin"
           }
