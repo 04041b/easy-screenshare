@@ -56,6 +56,18 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install libvpx pkg-config
 
+      # Cache vcpkg's installed lib tree so the next Windows run skips the
+      # ~3-minute `vcpkg install libvpx` step entirely. Key is bumped manually
+      # if the libvpx version we depend on shifts.
+      - name: Cache vcpkg libvpx (Windows)
+        if: runner.os == 'Windows'
+        id: cache-vcpkg
+        uses: actions/cache@v4
+        with:
+          path: C:/vcpkg/installed/x64-windows-static-md
+          key: vcpkg-libvpx-x64-windows-static-md-v1
+          enableCrossOsArchive: false
+
       # ---------- Windows deps ----------
       # libvpx via vcpkg, then point env-libvpx-sys at it without pkg-config.
       # env-libvpx-sys insists VPX_VERSION accompany VPX_LIB_DIR so it can
@@ -70,8 +82,12 @@ jobs:
           # a single-binary release with libvpx baked in. The plain
           # x64-windows triplet would install vpx.dll + an import .lib,
           # which is incompatible with VPX_STATIC=1.
-          vcpkg install libvpx:x64-windows-static-md
           $vcpkg = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md"
+          if (Test-Path "$vcpkg/lib/vpx.lib") {
+            Write-Host 'vcpkg cache hit - skipping vcpkg install libvpx'
+          } else {
+            vcpkg install libvpx:x64-windows-static-md
+          }
           Write-Host "vcpkg lib dir contents:"
           Get-ChildItem "$vcpkg/lib" | Select-Object Name, Length
           # vcpkg names the static lib `vpx.lib`, but env-libvpx-sys emits
