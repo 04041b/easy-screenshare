@@ -1,0 +1,49 @@
+[package]
+name = "screenshare"
+version = "0.1.0"
+edition = "2021"
+description = "Install-free screen sharing client with Cloudflare Worker backend"
+
+[[bin]]
+name = "screenshare"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.27"
+egui_extras = { version = "0.27", features = ["image"] }
+image = "0.25"
+qrcode = "0.14"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+bytes = "1"
+
+scap = "0.0.8"
+cpal = "0.15"
+
+webrtc = "0.11"
+vpx-encode = "0.5"
+opus = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# scap already wraps ScreenCaptureKit including system audio on macOS 13+.
+# Keeping this section as a hook in case we need direct access later.
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,19 @@
+name = "screenshare-backend"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+
+[[d1_databases]]
+binding = "SIGNAL_DB"
+database_name = "screenshare-signals"
+database_id = "d61bc693-639b-48cf-9a4c-3461ec4d504c"
+
+[[durable_objects.bindings]]
+name = "RELAY_ROOM"
+class_name = "RelayRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayRoom"]
+
+[observability]
+enabled = true

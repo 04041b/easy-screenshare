@@ -1,0 +1,14 @@
+# Rust
+/client/target/
+**/*.rs.bk
+
+# Node / Wrangler
+/backend/node_modules/
+/backend/.wrangler/
+/backend/.dev.vars
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
