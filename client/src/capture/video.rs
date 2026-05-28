@@ -1,12 +1,16 @@
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use scap::{
     capturer::{Capturer, Options, Resolution},
     frame::Frame,
 };
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// One captured video frame in BGRA8 layout.
+#[derive(Clone)]
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
@@ -45,9 +49,18 @@ impl VideoCapture {
 
         let (tx, rx) = mpsc::channel::<VideoFrame>(8);
 
-        let join = thread::spawn(move || {
-            let start = std::time::Instant::now();
+        // Latest valid frame, shared between the scap reader thread (writer)
+        // and the emitter thread (reader). When scap goes idle and starts
+        // emitting w=0/h=0 sentinels (idle screen, headless display, etc.),
+        // the emitter keeps publishing the last good frame at the target rate
+        // so the downstream encoder sees a steady stream.
+        let latest: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
+
+        let latest_writer = latest.clone();
+        let reader = thread::spawn(move || {
+            let start = Instant::now();
             let mut first_logged = false;
+            let mut empties_in_a_row = 0u32;
             loop {
                 let frame = match capturer.get_next_frame() {
                     Ok(f) => f,
@@ -57,39 +70,64 @@ impl VideoCapture {
                     }
                 };
                 let ts_us = start.elapsed().as_micros() as u64;
-                let parsed = match frame {
+                match frame {
                     Frame::BGRA(b) => {
+                        let w = b.width as u32;
+                        let h = b.height as u32;
+                        if w == 0 || h == 0 || b.data.is_empty() {
+                            empties_in_a_row = empties_in_a_row.saturating_add(1);
+                            if empties_in_a_row == 5 {
+                                tracing::warn!(
+                                    "scap is delivering empty frames — likely no display attached or screen is fully idle. Last good frame will be repeated."
+                                );
+                            }
+                            continue;
+                        }
+                        empties_in_a_row = 0;
                         if !first_logged {
-                            tracing::info!(
-                                w = b.width, h = b.height, bytes = b.data.len(),
-                                "first BGRA frame from scap"
-                            );
+                            tracing::info!(w, h, bytes = b.data.len(), "first BGRA frame from scap");
                             first_logged = true;
                         }
-                        Some(VideoFrame {
-                            width: b.width as u32,
-                            height: b.height as u32,
-                            stride: (b.width as u32) * 4,
+                        *latest_writer.lock() = Some(VideoFrame {
+                            width: w,
+                            height: h,
+                            stride: w * 4,
                             data: b.data,
                             timestamp_us: ts_us,
-                        })
+                        });
                     }
                     other => {
                         tracing::warn!("unexpected frame type: {:?}", std::mem::discriminant(&other));
-                        None
-                    }
-                };
-                if let Some(vf) = parsed {
-                    // drop if downstream is behind — better to skip than build latency
-                    if tx.blocking_send(vf).is_err() {
-                        break;
                     }
                 }
             }
             capturer.stop_capture();
         });
 
-        Ok(Self { rx, _join: join })
+        // Emitter: republish the latest captured frame at the target rate.
+        let frame_interval = Duration::from_micros(1_000_000 / target_fps as u64);
+        let latest_reader = latest.clone();
+        let emitter = thread::spawn(move || {
+            let mut next_tick = Instant::now();
+            let start = Instant::now();
+            loop {
+                let now = Instant::now();
+                if now < next_tick {
+                    thread::sleep(next_tick - now);
+                }
+                next_tick += frame_interval;
+                if let Some(mut frame) = latest_reader.lock().clone() {
+                    frame.timestamp_us = start.elapsed().as_micros() as u64;
+                    if tx.blocking_send(frame).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        // Keep the reader handle to drop together; we only return one join handle.
+        std::mem::drop(reader);
+
+        Ok(Self { rx, _join: emitter })
     }
 }
 
