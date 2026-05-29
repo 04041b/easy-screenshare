@@ -30,7 +30,7 @@ export class RelayRoom {
       this.state.acceptWebSocket(server, ["viewer"]);
     }
 
-    this.bumpIdleAlarm();
+    await this.bumpIdleAlarm();
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -42,7 +42,7 @@ export class RelayRoom {
     for (const v of viewers) {
       try { v.send(message); } catch {}
     }
-    this.bumpIdleAlarm();
+    await this.bumpIdleAlarm();
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string, _wasClean: boolean): Promise<void> {
@@ -67,7 +67,7 @@ export class RelayRoom {
     }
   }
 
-  private bumpIdleAlarm(): void {
-    this.state.storage.setAlarm(Date.now() + IDLE_TIMEOUT_MS);
+  private async bumpIdleAlarm(): Promise<void> {
+    await this.state.storage.setAlarm(Date.now() + IDLE_TIMEOUT_MS);
   }
 }

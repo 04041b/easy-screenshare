@@ -32,7 +32,7 @@ pub async fn run_sender(
     let url = ws_url(backend, id, "sender", Some(token), None);
     tracing::info!(%url, "opening sender relay ws");
     let (ws, _) = connect_async(&url).await.context("ws connect")?;
-    let (mut sink, _stream) = ws.split();
+    let (mut sink, mut stream) = ws.split();
 
     let cfg = RelayConfig {
         v: 1,
@@ -41,15 +41,51 @@ pub async fn run_sender(
     };
     sink.send(Message::Text(serde_json::to_string(&cfg)?)).await?;
 
+    // Video frames from the broadcast may arrive lagged (consumer started
+    // after the WS handshake). VP8 deltas can't be decoded without a
+    // preceding keyframe, so suppress video sends until we see a keyframe.
+    let mut seen_keyframe = false;
+
     loop {
         tokio::select! {
+            // Poll the read side too. tokio-tungstenite only auto-responds to
+            // server pings while the stream is being polled, so dropping it
+            // here would let Cloudflare close the WS for missed pongs after
+            // its idle window — which would then cascade to the DO closing
+            // all viewers with code 1000 ("idle timeout"). Surface any read
+            // errors as a clean break.
+            msg = stream.next() => {
+                match msg {
+                    Some(Ok(Message::Close(frame))) => {
+                        tracing::warn!(?frame, "relay closed by server");
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!("relay read err: {e}");
+                        break;
+                    }
+                    None => break,
+                    _ => {}
+                }
+            }
             v = video.recv() => {
                 match v {
                     Ok(f) => {
+                        if !seen_keyframe {
+                            if f.keyframe {
+                                seen_keyframe = true;
+                                tracing::info!("relay: first keyframe forwarded");
+                            } else {
+                                continue;
+                            }
+                        }
                         sink.send(Message::Binary(frame_to_bytes(&f))).await?;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(n, "video relay lagged");
+                        // After a lag we may have skipped past a keyframe;
+                        // force the next decision back through the gate.
+                        seen_keyframe = false;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
