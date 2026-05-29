@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct CreateSessionResponse {
     pub id: String,
     pub sender_token: String,
+    pub pin: String,
     pub viewer_url: String,
 }
 
@@ -54,21 +55,29 @@ impl SignalingClient {
         Ok(())
     }
 
-    pub async fn get_offer(&self, id: &str) -> anyhow::Result<Option<SdpEnvelope>> {
+    pub async fn get_offer(&self, id: &str, pin: &str) -> anyhow::Result<Option<SdpEnvelope>> {
         let r = self
             .http
             .get(format!("{}/api/sessions/{}/offer", self.base, id))
+            .header("X-Viewer-Pin", pin)
             .send()
             .await?;
         if r.status() == 404 {
             return Ok(None);
         }
+        if r.status() == 401 {
+            anyhow::bail!("invalid PIN");
+        }
+        if r.status() == 423 {
+            anyhow::bail!("session locked (too many failed PIN attempts)");
+        }
         Ok(Some(r.error_for_status()?.json().await?))
     }
 
-    pub async fn put_answer(&self, id: &str, sdp: &str) -> anyhow::Result<()> {
+    pub async fn put_answer(&self, id: &str, pin: &str, sdp: &str) -> anyhow::Result<()> {
         self.http
             .put(format!("{}/api/sessions/{}/answer", self.base, id))
+            .header("X-Viewer-Pin", pin)
             .json(&SdpEnvelope { sdp: sdp.into() })
             .send()
             .await?
@@ -112,13 +121,16 @@ impl SignalingClient {
     }
 }
 
-pub fn ws_url(base_http: &str, id: &str, role: &str, token: Option<&str>) -> String {
+/// Build the WS relay URL.
+/// - sender supplies `token = Some(sender_token)`, `pin = None`
+/// - viewer supplies `token = None`, `pin = Some(pin)`
+pub fn ws_url(base_http: &str, id: &str, role: &str, token: Option<&str>, pin: Option<&str>) -> String {
     let scheme = if base_http.starts_with("https://") { "wss://" } else { "ws://" };
     let host = base_http
         .trim_start_matches("https://")
         .trim_start_matches("http://");
-    match token {
-        Some(t) => format!("{scheme}{host}/ws/relay/{id}?role={role}&token={t}"),
-        None => format!("{scheme}{host}/ws/relay/{id}?role={role}"),
-    }
+    let mut url = format!("{scheme}{host}/ws/relay/{id}?role={role}");
+    if let Some(t) = token { url.push_str(&format!("&token={t}")); }
+    if let Some(p) = pin { url.push_str(&format!("&pin={p}")); }
+    url
 }

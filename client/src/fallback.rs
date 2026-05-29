@@ -29,7 +29,7 @@ pub async fn run_sender(
     mut video: broadcast::Receiver<EncodedFrame>,
     mut audio: broadcast::Receiver<EncodedFrame>,
 ) -> Result<()> {
-    let url = ws_url(backend, id, "sender", Some(token));
+    let url = ws_url(backend, id, "sender", Some(token), None);
     tracing::info!(%url, "opening sender relay ws");
     let (ws, _) = connect_async(&url).await.context("ws connect")?;
     let (mut sink, _stream) = ws.split();
@@ -70,8 +70,8 @@ pub async fn run_sender(
     Ok(())
 }
 
-pub async fn run_viewer(backend: &str, id: &str, sink: FrameSink) -> Result<()> {
-    let url = ws_url(backend, id, "viewer", None);
+pub async fn run_viewer(backend: &str, id: &str, pin: &str, sink: FrameSink) -> Result<()> {
+    let url = ws_url(backend, id, "viewer", None, Some(pin));
     tracing::info!(%url, "opening viewer relay ws");
     let (ws, _) = connect_async(&url).await.context("ws connect")?;
     let (_w, mut read) = ws.split();

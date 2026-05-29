@@ -8,11 +8,12 @@ interface Env {
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const BASE32_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+const PIN_FAIL_LIMIT = 5;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Sender-Token",
+  "Access-Control-Allow-Headers": "Content-Type, X-Sender-Token, X-Viewer-Pin",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -41,6 +42,27 @@ function randomHex(bytes: number): string {
   return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function generatePin(): string {
+  // 6 decimal digits, uniformly sampled from 0..999_999. Avoid leading-zero
+  // loss by zero-padding.
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return (buf[0] % 1_000_000).toString().padStart(6, "0");
+}
+
+async function hashPin(pin: string, salt: string): Promise<string> {
+  const enc = new TextEncoder().encode(`${salt}:${pin}`);
+  const digest = await crypto.subtle.digest("SHA-256", enc);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
 function isValidId(id: string): boolean {
   return /^[A-Z0-9]{8}$/.test(id);
 }
@@ -49,23 +71,59 @@ async function gcExpired(db: D1Database): Promise<void> {
   await db.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(Date.now()).run();
 }
 
-async function getSession(db: D1Database, id: string) {
-  return db
-    .prepare("SELECT id, sender_token, sender_offer, viewer_answer, fallback, expires_at FROM sessions WHERE id = ?")
-    .bind(id)
-    .first<{
-      id: string;
-      sender_token: string;
-      sender_offer: string | null;
-      viewer_answer: string | null;
-      fallback: number;
-      expires_at: number;
-    }>();
+interface SessionRow {
+  id: string;
+  sender_token: string;
+  pin_salt: string;
+  pin_hash: string;
+  pin_fails: number;
+  sender_offer: string | null;
+  viewer_answer: string | null;
+  fallback: number;
+  expires_at: number;
 }
 
-function requireSenderToken(req: Request, session: { sender_token: string }): Response | null {
+async function getSession(db: D1Database, id: string): Promise<SessionRow | null> {
+  return db
+    .prepare(
+      "SELECT id, sender_token, pin_salt, pin_hash, pin_fails, sender_offer, viewer_answer, fallback, expires_at FROM sessions WHERE id = ?",
+    )
+    .bind(id)
+    .first<SessionRow>();
+}
+
+function requireSenderToken(req: Request, session: SessionRow): Response | null {
   const token = req.headers.get("X-Sender-Token");
   if (!token || token !== session.sender_token) return err(401, "invalid sender token");
+  return null;
+}
+
+/**
+ * Validate the viewer PIN from the X-Viewer-Pin header (or `?pin=` query
+ * param, used by WS upgrades that can't set custom headers). On failure
+ * increments the session's pin_fails; at PIN_FAIL_LIMIT the session is
+ * locked and all further attempts return 423 until it expires.
+ */
+async function requireViewerPin(
+  db: D1Database,
+  req: Request,
+  url: URL,
+  session: SessionRow,
+): Promise<Response | null> {
+  if (session.pin_fails >= PIN_FAIL_LIMIT) {
+    return err(423, "session locked due to too many failed PIN attempts");
+  }
+  const pin = req.headers.get("X-Viewer-Pin") ?? url.searchParams.get("pin") ?? "";
+  if (!/^\d{6}$/.test(pin)) return err(401, "PIN required (6 digits)");
+  const candidate = await hashPin(pin, session.pin_salt);
+  if (!constantTimeEqual(candidate, session.pin_hash)) {
+    await db
+      .prepare("UPDATE sessions SET pin_fails = pin_fails + 1 WHERE id = ?")
+      .bind(session.id)
+      .run();
+    const remaining = Math.max(0, PIN_FAIL_LIMIT - session.pin_fails - 1);
+    return err(401, `invalid PIN (${remaining} attempts remaining)`);
+  }
   return null;
 }
 
@@ -92,13 +150,18 @@ export default {
       await gcExpired(env.SIGNAL_DB);
       const id = randomBase32(8);
       const senderToken = randomHex(16);
+      const pin = generatePin();
+      const pinSalt = randomHex(16);
+      const pinHash = await hashPin(pin, pinSalt);
       const now = Date.now();
       await env.SIGNAL_DB
-        .prepare("INSERT INTO sessions (id, sender_token, created_at, expires_at) VALUES (?, ?, ?, ?)")
-        .bind(id, senderToken, now, now + SESSION_TTL_MS)
+        .prepare(
+          "INSERT INTO sessions (id, sender_token, pin_salt, pin_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id, senderToken, pinSalt, pinHash, now, now + SESSION_TTL_MS)
         .run();
       const viewerUrl = `${url.origin}/viewer/${id}`;
-      return json({ id, sender_token: senderToken, viewer_url: viewerUrl });
+      return json({ id, sender_token: senderToken, pin, viewer_url: viewerUrl });
     }
 
     // /api/sessions/:id/<sub>
@@ -125,6 +188,8 @@ export default {
           return json({ ok: true });
         }
         if (method === "GET") {
+          const pinErr = await requireViewerPin(env.SIGNAL_DB, request, url, session);
+          if (pinErr) return pinErr;
           if (!session.sender_offer) return err(404, "offer not yet available");
           return new Response(session.sender_offer, {
             headers: { "Content-Type": "application/json", ...corsHeaders },
@@ -134,6 +199,8 @@ export default {
 
       if (sub === "answer") {
         if (method === "PUT") {
+          const pinErr = await requireViewerPin(env.SIGNAL_DB, request, url, session);
+          if (pinErr) return pinErr;
           const body = await readJson(request);
           if (!body || typeof body !== "object" || typeof (body as { sdp?: unknown }).sdp !== "string") {
             return err(400, "expected { sdp: string }");
@@ -180,7 +247,7 @@ export default {
       });
     }
 
-    // GET /ws/relay/:id?role=sender|viewer&token=...
+    // GET /ws/relay/:id?role=sender|viewer&token=...&pin=......
     const wsMatch = path.match(/^\/ws\/relay\/([A-Z0-9]{8})$/);
     if (wsMatch) {
       const id = wsMatch[1];
@@ -198,6 +265,9 @@ export default {
       if (role === "sender") {
         const token = url.searchParams.get("token");
         if (token !== session.sender_token) return err(401, "invalid sender token");
+      } else {
+        const pinErr = await requireViewerPin(env.SIGNAL_DB, request, url, session);
+        if (pinErr) return pinErr;
       }
 
       const doId = env.RELAY_ROOM.idFromName(id);

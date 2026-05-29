@@ -21,14 +21,17 @@ use crate::render;
 use crate::signaling::SignalingClient;
 use crate::webrtc_client::STUN_SERVERS;
 
-pub async fn run_native(backend: &str, code: &str) -> Result<()> {
+pub async fn run_native(backend: &str, code: &str, pin: &str) -> Result<()> {
     let code = code.to_uppercase();
+    if !pin.chars().all(|c| c.is_ascii_digit()) || pin.len() != 6 {
+        anyhow::bail!("PIN must be exactly 6 digits");
+    }
     let signaling = SignalingClient::new(backend);
 
     // 1. Fetch offer (with patience for sender still gathering)
     let mut offer = None;
     for _ in 0..60 {
-        if let Some(o) = signaling.get_offer(&code).await? {
+        if let Some(o) = signaling.get_offer(&code, pin).await? {
             offer = Some(o);
             break;
         }
@@ -118,7 +121,7 @@ pub async fn run_native(backend: &str, code: &str) -> Result<()> {
     pc.set_local_description(answer).await?;
     gather.recv().await;
     let local = pc.local_description().await.context("no local desc")?;
-    signaling.put_answer(&code, &local.sdp).await?;
+    signaling.put_answer(&code, pin, &local.sdp).await?;
 
     let connect_timeout = sleep(Duration::from_secs(15));
     tokio::pin!(connect_timeout);
@@ -131,20 +134,20 @@ pub async fn run_native(backend: &str, code: &str) -> Result<()> {
         }
         _ = failed.notified() => {
             tracing::warn!("viewer WebRTC failed, polling for fallback");
-            wait_and_relay(backend, &code, frame_sink).await
+            wait_and_relay(backend, &code, pin, frame_sink).await
         }
         _ = &mut connect_timeout => {
             tracing::warn!("viewer WebRTC timeout, polling for fallback");
-            wait_and_relay(backend, &code, frame_sink).await
+            wait_and_relay(backend, &code, pin, frame_sink).await
         }
     }
 }
 
-async fn wait_and_relay(backend: &str, code: &str, sink: render::FrameSink) -> Result<()> {
+async fn wait_and_relay(backend: &str, code: &str, pin: &str, sink: render::FrameSink) -> Result<()> {
     let signaling = SignalingClient::new(backend);
     for _ in 0..30 {
         if signaling.get_fallback(code).await.unwrap_or(false) {
-            return fallback::run_viewer(backend, code, sink).await;
+            return fallback::run_viewer(backend, code, pin, sink).await;
         }
         sleep(Duration::from_secs(2)).await;
     }

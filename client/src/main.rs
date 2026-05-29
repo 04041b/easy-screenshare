@@ -25,7 +25,11 @@ enum Mode {
     /// Start sharing your screen immediately (headless, prints the share URL).
     Share,
     /// Join a share as a viewer in a native window.
-    View { code: String },
+    View {
+        code: String,
+        /// 6-digit PIN shown by the sender.
+        pin: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -45,7 +49,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Some(Mode::Share) => rt.block_on(webrtc_client::sender::run_headless(&backend)),
-        Some(Mode::View { code }) => rt.block_on(webrtc_client::viewer::run_native(&backend, &code)),
+        Some(Mode::View { code, pin }) => rt.block_on(webrtc_client::viewer::run_native(&backend, &code, &pin)),
         None => app::run_gui(rt, backend),
     }
 }

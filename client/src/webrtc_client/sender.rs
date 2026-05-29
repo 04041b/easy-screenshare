@@ -23,24 +23,34 @@ use crate::fallback;
 use crate::signaling::SignalingClient;
 use crate::webrtc_client::{codec, STUN_SERVERS};
 
-/// Headless entrypoint: starts sharing and prints the URL.
+/// Headless entrypoint: starts sharing and prints the URL + PIN.
 pub async fn run_headless(backend: &str) -> Result<()> {
-    run_with_callbacks(backend, |url| {
-        println!("Share URL: {url}");
+    run_with_callbacks(backend, |info| {
+        println!("Share URL: {}", info.viewer_url);
+        println!("PIN: {}", info.pin);
     })
     .await
+}
+
+#[derive(Clone)]
+pub struct ShareInfo {
+    pub viewer_url: String,
+    pub pin: String,
 }
 
 /// Library entrypoint used by both the GUI and headless modes.
 pub async fn run_with_callbacks<F>(backend: &str, on_url: F) -> Result<()>
 where
-    F: FnOnce(String) + Send + 'static,
+    F: FnOnce(ShareInfo) + Send + 'static,
 {
     let signaling = SignalingClient::new(backend);
 
     // 1. Create session
     let session = signaling.create_session().await.context("create session")?;
-    on_url(session.viewer_url.clone());
+    on_url(ShareInfo {
+        viewer_url: session.viewer_url.clone(),
+        pin: session.pin.clone(),
+    });
     tracing::info!(id = %session.id, "session created");
 
     // 2. Build PeerConnection

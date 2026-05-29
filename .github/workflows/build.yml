@@ -40,16 +40,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry & target
-        uses: actions/cache@v4
+      # Swatinem/rust-cache caches the cargo registry, git index, and
+      # client/target/ — but cleverly: it scopes the target cache by
+      # workspace member, prunes build artefacts for crates whose source
+      # hasn't changed since the last cache save, and restores partially
+      # when Cargo.lock changes. Net effect on this project: a pure-relink
+      # build finishes in ~30s instead of compiling 600+ deps from scratch.
+      - name: Cache cargo (Rust)
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            client/target
-          key: ${{ runner.os }}-${{ matrix.label }}-cargo-${{ hashFiles('client/Cargo.lock', 'client/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.label }}-cargo-
+          workspaces: client
+          shared-key: ${{ matrix.label }}
+          cache-on-failure: true
 
       # ---------- macOS deps ----------
       - name: Install libvpx (macOS)
