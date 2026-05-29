@@ -7,7 +7,7 @@ mod webrtc_client;
 
 use clap::{Parser, Subcommand};
 
-const DEFAULT_BACKEND: &str = "https://screenshare-backend.example.workers.dev";
+const DEFAULT_BACKEND: &str = "https://screenshare-backend.04041b.workers.dev";
 
 #[derive(Parser, Debug)]
 #[command(name = "screenshare", version, about = "Install-free screen sharing")]
