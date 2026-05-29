@@ -6,6 +6,9 @@
 /backend/node_modules/
 /backend/.wrangler/
 /backend/.dev.vars
+# wrangler also stores per-user account cache at the repo root when invoked
+# from there — keep it out of the tree wherever it lands
+.wrangler/
 
 # Editor / OS
 .DS_Store
