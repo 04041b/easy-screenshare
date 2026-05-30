@@ -75,6 +75,7 @@ impl VideoCapture {
         let reader_fps = target_fps;
         let reader_res = target_resolution;
         let reader = thread::spawn(move || {
+            super::lower_thread_priority_for_background_work();
             // Build the Capturer inside the thread. On Windows, scap's
             // Options contains Option<Target> where Target::Window holds an
             // HWND(*mut c_void) — making Options unconditionally !Send.
@@ -177,6 +178,7 @@ impl VideoCapture {
         let frame_interval = Duration::from_micros(1_000_000 / target_fps as u64);
         let latest_reader = latest.clone();
         let emitter = thread::spawn(move || {
+            super::lower_thread_priority_for_background_work();
             let mut next_tick = Instant::now();
             let start = Instant::now();
             loop {

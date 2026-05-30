@@ -1,6 +1,22 @@
 pub mod audio;
 pub mod video;
 
+/// Drop the calling thread's OS scheduling priority to BELOW_NORMAL on
+/// Windows. No-op everywhere else. Used by the capture reader and the
+/// VP8 encoder threads so that, when the user is running a game on the
+/// same machine, the game's render thread (which usually sits at NORMAL
+/// or ABOVE_NORMAL) keeps scheduler priority and doesn't get knocked
+/// down to ~30 fps fighting our encode loop for cores.
+pub fn lower_thread_priority_for_background_work() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
 pub use audio::{AudioCapture, AudioFrame};
 pub use scap::capturer::Resolution;
 pub use video::{VideoCapture, VideoFrame};

@@ -50,6 +50,11 @@ windows-capture = "=1.4.4"
 # wasapi exposes the loopback flag directly via Direction::Capture on a
 # Render-direction device.
 wasapi = "0.15"
+# SetThreadPriority — used to drop our capture/encoder threads to
+# BELOW_NORMAL so a game sharing the same machine keeps scheduler
+# priority. Without this, our 30 fps encode loop competes directly with
+# the game's render thread and both drop frames.
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # scap already wraps ScreenCaptureKit including system audio on macOS 13+.

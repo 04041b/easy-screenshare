@@ -19,7 +19,7 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
-use crate::capture::{AudioCapture, Quality, VideoCapture};
+use crate::capture::{lower_thread_priority_for_background_work, AudioCapture, Quality, VideoCapture};
 use crate::fallback;
 use crate::signaling::SignalingClient;
 use crate::webrtc_client::{codec, STUN_SERVERS};
@@ -275,6 +275,7 @@ fn start_video_pump(
     let force_keyframe_thread = Arc::clone(&force_keyframe);
 
     std::thread::spawn(move || {
+        lower_thread_priority_for_background_work();
         let mut encoder: Option<vpx_encode::Encoder> = None;
         let mut enc_w = 0u32;
         let mut enc_h = 0u32;
@@ -315,7 +316,33 @@ fn start_video_pump(
                     codec: vpx_encode::VideoCodecId::VP8,
                 };
                 match vpx_encode::Encoder::new(cfg) {
-                    Ok(e) => {
+                    Ok(mut e) => {
+                        // vpx-encode 0.5.0 leaves VP8 at the default
+                        // cpu_used=0 (best-quality, slowest), which is wildly
+                        // wrong for realtime: a 1080p 30 fps encode can take
+                        // 30–50 ms per frame, half a core, and that's what
+                        // tanks game framerate on Windows. cpu_used=8 puts
+                        // libvpx in realtime mode (~5–10 ms per frame at the
+                        // same resolution). The crate doesn't expose this
+                        // knob, so we reach through its `Encoder` struct.
+                        // SAFETY: vpx-encode 0.5.0's `Encoder` has `ctx`
+                        // as its first field; the crate is version-pinned
+                        // in Cargo.toml and Cargo.lock so the layout is
+                        // stable for this build.
+                        unsafe {
+                            let ctx_ptr = (&mut e as *mut vpx_encode::Encoder)
+                                .cast::<vpx_sys::vpx_codec_ctx_t>();
+                            let rc = vpx_sys::vpx_codec_control_(
+                                ctx_ptr,
+                                vpx_sys::vp8e_enc_control_id::VP8E_SET_CPUUSED as i32,
+                                8 as std::os::raw::c_int,
+                            );
+                            if rc != vpx_sys::vpx_codec_err_t::VPX_CODEC_OK {
+                                tracing::warn!(?rc, "VP8E_SET_CPUUSED failed; encoder will run at default speed");
+                            } else {
+                                tracing::info!("VP8 encoder set to realtime preset (cpu_used=8)");
+                            }
+                        }
                         encoder = Some(e);
                         enc_w = frame.width;
                         enc_h = frame.height;
