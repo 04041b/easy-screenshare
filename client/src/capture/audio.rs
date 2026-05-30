@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(not(target_os = "windows"))]
+use anyhow::Context;
 #[cfg(not(target_os = "windows"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::sync::mpsc;
@@ -117,79 +119,88 @@ impl AudioCapture {
             get_default_device, initialize_mta, Direction, SampleType, ShareMode, WaveFormat,
         };
 
-        // COM init. `initialize_mta()` returns Ok if MTA is already initialized
-        // on this thread or sets it if not.
-        initialize_mta()
-            .ok()
-            .map_err(|e| anyhow::anyhow!("wasapi MTA init: {e:?}"))?;
-
-        let device = get_default_device(&Direction::Render)
-            .map_err(|e| anyhow::anyhow!("default render device: {e:?}"))?;
-        let mut audio_client = device
-            .get_iaudioclient()
-            .map_err(|e| anyhow::anyhow!("get iaudioclient: {e:?}"))?;
-
-        // Ask WASAPI to deliver exactly what our Opus encoder wants. The
-        // 5th arg (`convert = true`) sets AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-        // + SRC_DEFAULT_QUALITY, so WASAPI will resample/format-convert from
-        // whatever the device runs at — no manual resampler needed.
+        // WASAPI / COM types from `windows-core` hold `NonNull<c_void>` and
+        // are `!Send`, so they cannot be moved into a worker thread after
+        // being constructed on the caller. Instead, do *all* of COM init,
+        // device acquisition, IAudioClient setup, and the capture loop on
+        // the worker thread, and signal init success/failure back through a
+        // synchronous oneshot.
         let sample_rate: u32 = 48_000;
         let channels: u16 = 2;
-        let desired_format = WaveFormat::new(
-            32,
-            32,
-            &SampleType::Float,
-            sample_rate as usize,
-            channels as usize,
-            None,
-        );
-
-        let (_def_time, min_time) = audio_client
-            .get_periods()
-            .map_err(|e| anyhow::anyhow!("get_periods: {e:?}"))?;
-        // Device direction Render + init direction Capture is the magic combo
-        // wasapi uses to set AUDCLNT_STREAMFLAGS_LOOPBACK (see wasapi-0.15/src/api.rs).
-        audio_client
-            .initialize_client(
-                &desired_format,
-                min_time,
-                &Direction::Capture,
-                &ShareMode::Shared,
-                true,
-            )
-            .map_err(|e| anyhow::anyhow!("initialize_client: {e:?}"))?;
-
-        let h_event = audio_client
-            .set_get_eventhandle()
-            .map_err(|e| anyhow::anyhow!("set_get_eventhandle: {e:?}"))?;
-        let capture_client = audio_client
-            .get_audiocaptureclient()
-            .map_err(|e| anyhow::anyhow!("get_audiocaptureclient: {e:?}"))?;
-
-        audio_client
-            .start_stream()
-            .map_err(|e| anyhow::anyhow!("start_stream: {e:?}"))?;
-
         let (tx, rx) = mpsc::channel::<AudioFrame>(32);
+        let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
         let start = std::time::Instant::now();
-        let block_align = desired_format.get_blockalign() as usize; // bytes per frame (8 for stereo f32)
-        // Hand off the encoded packet boundary roughly every 20ms (Opus frame).
-        // 960 frames * 8 bytes = 7680 bytes per packet.
-        let packet_bytes = 960 * block_align;
 
         std::thread::spawn(move || {
-            // Keep the audio_client alive in this thread; dropping it tears
-            // down the WASAPI stream.
-            let _ac = audio_client;
+            let setup = || -> Result<(_, _, _, usize)> {
+                initialize_mta()
+                    .ok()
+                    .map_err(|e| anyhow::anyhow!("wasapi MTA init: {e:?}"))?;
+                let device = get_default_device(&Direction::Render)
+                    .map_err(|e| anyhow::anyhow!("default render device: {e:?}"))?;
+                let mut audio_client = device
+                    .get_iaudioclient()
+                    .map_err(|e| anyhow::anyhow!("get iaudioclient: {e:?}"))?;
+                // Ask WASAPI to deliver what our Opus encoder wants. The
+                // 5th arg (`convert = true`) sets AUTOCONVERTPCM +
+                // SRC_DEFAULT_QUALITY, so WASAPI resamples/format-converts
+                // from whatever the device runs at — no manual resampler.
+                let desired_format = WaveFormat::new(
+                    32,
+                    32,
+                    &SampleType::Float,
+                    sample_rate as usize,
+                    channels as usize,
+                    None,
+                );
+                let (_def_time, min_time) = audio_client
+                    .get_periods()
+                    .map_err(|e| anyhow::anyhow!("get_periods: {e:?}"))?;
+                // Render-device direction + Capture init direction is the
+                // magic combo wasapi-0.15 uses to set
+                // AUDCLNT_STREAMFLAGS_LOOPBACK (see wasapi-0.15/src/api.rs:777).
+                audio_client
+                    .initialize_client(
+                        &desired_format,
+                        min_time,
+                        &Direction::Capture,
+                        &ShareMode::Shared,
+                        true,
+                    )
+                    .map_err(|e| anyhow::anyhow!("initialize_client: {e:?}"))?;
+                let h_event = audio_client
+                    .set_get_eventhandle()
+                    .map_err(|e| anyhow::anyhow!("set_get_eventhandle: {e:?}"))?;
+                let capture_client = audio_client
+                    .get_audiocaptureclient()
+                    .map_err(|e| anyhow::anyhow!("get_audiocaptureclient: {e:?}"))?;
+                audio_client
+                    .start_stream()
+                    .map_err(|e| anyhow::anyhow!("start_stream: {e:?}"))?;
+                let block_align = desired_format.get_blockalign() as usize; // 8 bytes/frame for stereo f32
+                Ok((audio_client, h_event, capture_client, block_align))
+            };
+
+            let (_audio_client, h_event, capture_client, block_align) = match setup() {
+                Ok(v) => {
+                    let _ = init_tx.send(Ok(()));
+                    v
+                }
+                Err(e) => {
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+
+            // 20ms packets to match the Opus frame size downstream.
+            let packet_bytes = 960 * block_align;
             let mut byte_queue: VecDeque<u8> = VecDeque::with_capacity(packet_bytes * 8);
             let mut first_logged = false;
             loop {
-                // 1000ms event timeout — long enough that idle playback (no
-                // sound being rendered) doesn't burn CPU, short enough that
-                // shutdown via Receiver-drop is detected within ~1s.
+                // 1000ms event timeout — long enough that idle playback
+                // (no sound being rendered) doesn't burn CPU; short enough
+                // that shutdown via Receiver-drop is detected within ~1s.
                 if h_event.wait_for_event(1000).is_err() {
-                    // Either timeout or stream stopped; keep waiting unless the
-                    // mpsc has closed.
                     if tx.is_closed() {
                         break;
                     }
@@ -226,8 +237,9 @@ impl AudioCapture {
                     }) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            // Encoder is behind; drop this 20ms. Opus frames are
-                            // independently decodable so a drop is just a glitch.
+                            // Encoder is behind; drop this 20ms. Opus frames
+                            // are independently decodable so a drop is just
+                            // a glitch.
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => return,
                     }
@@ -236,10 +248,16 @@ impl AudioCapture {
             tracing::info!("wasapi loopback thread ending");
         });
 
-        Ok(Self {
-            rx,
-            sample_rate,
-            channels,
-        })
+        // Block briefly for the init result. The thread sends Ok/Err once
+        // it's either ready to capture or has hit a fatal setup error.
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                rx,
+                sample_rate,
+                channels,
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => anyhow::bail!("wasapi loopback thread died before init"),
+        }
     }
 }
