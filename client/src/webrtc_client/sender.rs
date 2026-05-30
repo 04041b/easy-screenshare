@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -158,7 +158,8 @@ where
 
     // 7. Start media pumps now — encoder threads write to tracks regardless of P2P state;
     //    fallback path reuses the same encoded frames over WS if WebRTC fails.
-    let (video_pump_handle, video_bcast, force_keyframe) = start_video_pump(video_track.clone(), quality)?;
+    let (video_pump_handle, video_bcast, force_keyframe, target_bitrate_kbps) =
+        start_video_pump(video_track.clone(), quality)?;
     let (audio_pump_handle, audio_bcast) = start_audio_pump(audio_track.clone())?;
 
     // 8. Watch for connection result.
@@ -195,6 +196,8 @@ where
             backend, &session.id, &session.sender_token,
             video_bcast.subscribe(), audio_bcast.subscribe(),
             force_keyframe,
+            target_bitrate_kbps,
+            quality.bitrate_kbps(),
         ).await?;
         return Ok(());
     }
@@ -217,6 +220,8 @@ where
                 backend, &session.id, &session.sender_token,
                 video_bcast.subscribe(), audio_bcast.subscribe(),
                 force_keyframe,
+                target_bitrate_kbps,
+                quality.bitrate_kbps(),
             ).await?;
         }
         _ = video_pump_handle => {
@@ -240,9 +245,16 @@ fn start_video_pump(
     tokio::task::JoinHandle<()>,
     tokio::sync::broadcast::Sender<EncodedFrame>,
     Arc<AtomicBool>,
+    Arc<AtomicU32>,
 )> {
     let mut capture = VideoCapture::start(quality.fps(), quality.resolution())?;
-    let bitrate_kbps = quality.bitrate_kbps();
+    // Mutable target bitrate so the relay's congestion controller can adapt
+    // it on the fly. The encoder thread reads this each loop iteration and
+    // re-inits the libvpx encoder when it changes (vpx-encode 0.5.0 doesn't
+    // expose a runtime bitrate setter, so re-init is the path — same trick
+    // we use for force_keyframe).
+    let target_bitrate_kbps = Arc::new(AtomicU32::new(quality.bitrate_kbps()));
+    let target_bitrate_thread = Arc::clone(&target_bitrate_kbps);
     let frame_duration = Duration::from_micros(1_000_000 / quality.fps() as u64);
     // Returning the Sender (not the initial Receiver) so callers can subscribe
     // at the moment they actually want a feed — used by the mid-stream-failure
@@ -266,6 +278,7 @@ fn start_video_pump(
         let mut encoder: Option<vpx_encode::Encoder> = None;
         let mut enc_w = 0u32;
         let mut enc_h = 0u32;
+        let mut enc_bitrate_kbps: u32 = 0;
         let mut t0_us: Option<u64> = None;
         let mut frames_seen = 0u64;
 
@@ -284,17 +297,21 @@ fn start_video_pump(
                 }
                 continue;
             }
+            let desired_bitrate = target_bitrate_thread.load(Ordering::Relaxed);
             if force_keyframe_thread.swap(false, Ordering::Relaxed) {
-                tracing::info!("force_keyframe set — reinitialising encoder");
+                tracing::info!(bitrate = desired_bitrate, "force_keyframe set — reinitialising encoder");
+                encoder = None;
+            } else if encoder.is_some() && enc_bitrate_kbps != desired_bitrate {
+                tracing::info!(prev = enc_bitrate_kbps, new = desired_bitrate, "abr: reinitialising encoder at new bitrate");
                 encoder = None;
             }
             if encoder.is_none() || enc_w != frame.width || enc_h != frame.height {
-                tracing::info!(w = frame.width, h = frame.height, "initializing VP8 encoder");
+                tracing::info!(w = frame.width, h = frame.height, bitrate = desired_bitrate, "initializing VP8 encoder");
                 let cfg = vpx_encode::Config {
                     width: frame.width,
                     height: frame.height,
                     timebase: [1, 1000],
-                    bitrate: bitrate_kbps,
+                    bitrate: desired_bitrate,
                     codec: vpx_encode::VideoCodecId::VP8,
                 };
                 match vpx_encode::Encoder::new(cfg) {
@@ -302,6 +319,7 @@ fn start_video_pump(
                         encoder = Some(e);
                         enc_w = frame.width;
                         enc_h = frame.height;
+                        enc_bitrate_kbps = desired_bitrate;
                     }
                     Err(e) => {
                         tracing::error!(w = frame.width, h = frame.height, "vpx encoder init failed: {e}");
@@ -364,7 +382,7 @@ fn start_video_pump(
         }
     });
 
-    Ok((handle, bcast_tx, force_keyframe))
+    Ok((handle, bcast_tx, force_keyframe, target_bitrate_kbps))
 }
 
 /// Same pattern for audio: opus::Encoder is `!Send`, so the encode loop runs
