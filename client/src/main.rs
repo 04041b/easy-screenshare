@@ -69,7 +69,7 @@ async fn probe_capture() -> anyhow::Result<()> {
         .count();
     println!("capturable displays = {displays}");
 
-    let mut capture = capture::VideoCapture::start(30)?;
+    let mut capture = capture::VideoCapture::start(30, capture::Resolution::_1080p)?;
     println!("VideoCapture::start ok — waiting up to 5s for the first frame...");
     match tokio::time::timeout(std::time::Duration::from_secs(5), capture.rx.recv()).await {
         Ok(Some(f)) => {

@@ -44,6 +44,11 @@ opus = "0.3"
 # in 1.4) but also calls Settings::new with 5 args (which became 8 in 1.5).
 # 1.4.4 is the last release that has both shapes.
 windows-capture = "=1.4.4"
+# cpal opens the default render device as an input but never sets
+# AUDCLNT_STREAMFLAGS_LOOPBACK, so callbacks never fire and we get no audio.
+# wasapi exposes the loopback flag directly via Direction::Capture on a
+# Render-direction device.
+wasapi = "0.15"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # scap already wraps ScreenCaptureKit including system audio on macOS 13+.

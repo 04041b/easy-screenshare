@@ -25,7 +25,7 @@ pub struct VideoCapture {
 }
 
 impl VideoCapture {
-    pub fn start(target_fps: u32) -> Result<Self> {
+    pub fn start(target_fps: u32, target_resolution: Resolution) -> Result<Self> {
         if !scap::is_supported() {
             anyhow::bail!("screen capture is not supported on this platform/version");
         }
@@ -73,6 +73,7 @@ impl VideoCapture {
 
         let latest_writer = latest.clone();
         let reader_fps = target_fps;
+        let reader_res = target_resolution;
         let reader = thread::spawn(move || {
             // Build the Capturer inside the thread. On Windows, scap's
             // Options contains Option<Target> where Target::Window holds an
@@ -83,13 +84,14 @@ impl VideoCapture {
                 show_cursor: true,
                 show_highlight: false,
                 output_type: scap::frame::FrameType::BGRAFrame,
-                output_resolution: Resolution::_1080p,
+                output_resolution: reader_res,
                 ..Default::default()
             };
             let mut capturer = Capturer::new(opts);
             capturer.start_capture();
             let start = Instant::now();
             let mut first_logged = false;
+            let mut scaled_log_done = false;
             let mut empties_in_a_row = 0u32;
             loop {
                 let frame = match capturer.get_next_frame() {
@@ -118,11 +120,48 @@ impl VideoCapture {
                             tracing::info!(w, h, bytes = b.data.len(), "first BGRA frame from scap");
                             first_logged = true;
                         }
+                        // scap's Windows backend (windows-capture) silently
+                        // ignores `output_resolution`, so we get the native
+                        // display size (e.g. 2560×1600 on a 16:10 laptop).
+                        // Encoding that at our preset bitrate is starvation
+                        // and triggers a lag/keyframe thrash spiral. Downscale
+                        // here to the requested resolution; on backends that
+                        // honored the request this becomes a no-op.
+                        // `Resolution::value()` is private in scap, so duplicate
+                        // its width table. Height tracks the source aspect ratio
+                        // and is even-aligned because VP8 requires even dims.
+                        let target_w: u32 = match reader_res {
+                            Resolution::_480p => 640,
+                            Resolution::_720p => 1280,
+                            Resolution::_1080p => 1920,
+                            Resolution::_1440p => 2560,
+                            Resolution::_2160p => 3840,
+                            Resolution::_4320p => 7680,
+                            _ => 0,
+                        };
+                        let target_h: u32 = if target_w == 0 || w == 0 {
+                            0
+                        } else {
+                            let h_calc = (target_w as u64 * h as u64 / w as u64) as u32;
+                            h_calc & !1
+                        };
+                        let tw = target_w & !1;
+                        let th = target_h;
+                        let (final_w, final_h, final_data) = if tw > 0 && th > 0 && tw < w && th < h && tw >= 16 && th >= 16 {
+                            let scaled = downscale_bgra(&b.data, w, h, tw, th);
+                            if !scaled_log_done {
+                                tracing::info!(src_w = w, src_h = h, dst_w = tw, dst_h = th, "downscaling capture in-process (scap backend did not honor output_resolution)");
+                                scaled_log_done = true;
+                            }
+                            (tw, th, scaled)
+                        } else {
+                            (w, h, b.data)
+                        };
                         *latest_writer.lock() = Some(VideoFrame {
-                            width: w,
-                            height: h,
-                            stride: w * 4,
-                            data: b.data,
+                            width: final_w,
+                            height: final_h,
+                            stride: final_w * 4,
+                            data: final_data,
                             timestamp_us: ts_us,
                         });
                     }
@@ -160,6 +199,32 @@ impl VideoCapture {
         Ok(Self { rx, _join: emitter })
     }
 
+}
+
+/// Nearest-neighbor BGRA downscale. Chosen for speed over visual quality —
+/// screen content is mostly low-frequency (UI, text glyphs) so the artefacts
+/// are tolerable, and the VP8 encoder further smooths what's left. A box
+/// filter would be ~4× slower per pixel and we're already on the hot path
+/// at ~30 fps × multi-megapixel frames. `stride_bytes` lets us skip any row
+/// padding the capturer adds; pass `src_w * 4` when there's none.
+fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    let stride_bytes = (src_w * 4) as usize;
+    let dst_row_bytes = (dst_w * 4) as usize;
+    let mut dst = vec![0u8; dst_row_bytes * dst_h as usize];
+    for dy in 0..dst_h {
+        // Sample-center mapping: dst pixel center at (dy + 0.5) / dst_h of the
+        // source range; equivalent to ((dy * 2 + 1) * src_h) / (dst_h * 2).
+        let sy = ((dy as u64 * 2 + 1) * src_h as u64) / (dst_h as u64 * 2);
+        let src_row = sy as usize * stride_bytes;
+        let dst_row = dy as usize * dst_row_bytes;
+        for dx in 0..dst_w {
+            let sx = ((dx as u64 * 2 + 1) * src_w as u64) / (dst_w as u64 * 2);
+            let s = src_row + sx as usize * 4;
+            let d = dst_row + dx as usize * 4;
+            dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
+    }
+    dst
 }
 
 pub fn primary_resolution() -> Result<(u32, u32)> {

@@ -19,14 +19,14 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
-use crate::capture::{AudioCapture, VideoCapture};
+use crate::capture::{AudioCapture, Quality, VideoCapture};
 use crate::fallback;
 use crate::signaling::SignalingClient;
 use crate::webrtc_client::{codec, STUN_SERVERS};
 
 /// Headless entrypoint: starts sharing and prints the URL + PIN.
 pub async fn run_headless(backend: &str) -> Result<()> {
-    run_with_callbacks(backend, |info| {
+    run_with_callbacks(backend, Quality::default(), |info| {
         println!("Share URL: {}", info.viewer_url);
         println!("PIN: {}", info.pin);
     })
@@ -40,10 +40,11 @@ pub struct ShareInfo {
 }
 
 /// Library entrypoint used by both the GUI and headless modes.
-pub async fn run_with_callbacks<F>(backend: &str, on_url: F) -> Result<()>
+pub async fn run_with_callbacks<F>(backend: &str, quality: Quality, on_url: F) -> Result<()>
 where
     F: FnOnce(ShareInfo) + Send + 'static,
 {
+    tracing::info!(?quality, "starting sender at {}", quality.label());
     let signaling = SignalingClient::new(backend);
 
     // 1. Create session
@@ -157,37 +158,74 @@ where
 
     // 7. Start media pumps now — encoder threads write to tracks regardless of P2P state;
     //    fallback path reuses the same encoded frames over WS if WebRTC fails.
-    let (video_pump_handle, video_tap, force_keyframe) = start_video_pump(video_track.clone())?;
-    let (audio_pump_handle, audio_tap) = start_audio_pump(audio_track.clone())?;
+    let (video_pump_handle, video_bcast, force_keyframe) = start_video_pump(video_track.clone(), quality)?;
+    let (audio_pump_handle, audio_bcast) = start_audio_pump(audio_track.clone())?;
 
-    // 8. Watch for connection result; on failure, escalate to WS relay
-    let connect_timeout = sleep(Duration::from_secs(15));
-    tokio::pin!(connect_timeout);
+    // 8. Watch for connection result.
+    // A working P2P path completes the DTLS handshake in well under 2s (LAN
+    // <1s, STUN-mediated typically 1–2s). When the browser offers DTLS 1.3
+    // extensions webrtc-rs doesn't understand (Windows path, see AGENTS.md)
+    // the handshake stalls without ever reaching the Failed state, so the
+    // only signal we get is this timer firing. Keep it tight so the viewer
+    // sees pixels via the relay quickly instead of staring at black.
+    enum ConnectOutcome { Connected, Failed, Timeout }
+    let outcome = {
+        let connect_timeout = sleep(Duration::from_secs(4));
+        tokio::pin!(connect_timeout);
+        tokio::select! {
+            _ = connected.notified() => ConnectOutcome::Connected,
+            _ = failed.notified() => ConnectOutcome::Failed,
+            _ = &mut connect_timeout => ConnectOutcome::Timeout,
+        }
+    };
 
-    tokio::select! {
-        _ = connected.notified() => {
-            tracing::info!("WebRTC connected");
-        }
-        _ = failed.notified() => {
-            tracing::warn!("WebRTC failed, escalating to fallback relay");
-            signaling.put_fallback(&session.id, &session.sender_token).await?;
-            // The encoder has been running since step 7 with a tiny 16-slot
-            // broadcast buffer; the fallback receiver will almost certainly
-            // come up Lagged past the only keyframe scap produced at start.
-            // Force a fresh keyframe so the late subscriber can decode.
-            force_keyframe.store(true, Ordering::Relaxed);
-            fallback::run_sender(backend, &session.id, &session.sender_token, video_tap, audio_tap, force_keyframe).await?;
-        }
-        _ = &mut connect_timeout => {
-            tracing::warn!("WebRTC connect timeout, escalating to fallback relay");
-            signaling.put_fallback(&session.id, &session.sender_token).await?;
-            force_keyframe.store(true, Ordering::Relaxed);
-            fallback::run_sender(backend, &session.id, &session.sender_token, video_tap, audio_tap, force_keyframe).await?;
-        }
+    if !matches!(outcome, ConnectOutcome::Connected) {
+        let reason = match outcome {
+            ConnectOutcome::Failed => "failed during connect",
+            ConnectOutcome::Timeout => "connect timeout",
+            _ => unreachable!(),
+        };
+        tracing::warn!(reason, "escalating to fallback relay");
+        signaling.put_fallback(&session.id, &session.sender_token).await?;
+        // The encoder has been running since step 7 with a small broadcast
+        // buffer; a late subscriber will Lag past the only keyframe scap
+        // produced at start. Force a fresh keyframe so it can decode.
+        force_keyframe.store(true, Ordering::Relaxed);
+        fallback::run_sender(
+            backend, &session.id, &session.sender_token,
+            video_bcast.subscribe(), audio_bcast.subscribe(),
+            force_keyframe,
+        ).await?;
+        return Ok(());
     }
 
-    let _ = video_pump_handle.await;
-    let _ = audio_pump_handle.await;
+    tracing::info!("WebRTC connected");
+
+    // 9. Mid-stream watcher. Previously we just awaited the pumps after
+    // `connected` and ignored any later `failed`, so a WebRTC transport that
+    // died after connection (carrier flap, ICE consent failure, peer reset)
+    // left the pumps writing samples into a dead track forever — viewer saw
+    // a frozen screen with no recovery path. Now we race a fresh
+    // `failed.notified()` against pump termination so we can escalate to
+    // the relay mid-stream.
+    tokio::select! {
+        _ = failed.notified() => {
+            tracing::warn!("WebRTC failed mid-stream, escalating to fallback relay");
+            signaling.put_fallback(&session.id, &session.sender_token).await?;
+            force_keyframe.store(true, Ordering::Relaxed);
+            fallback::run_sender(
+                backend, &session.id, &session.sender_token,
+                video_bcast.subscribe(), audio_bcast.subscribe(),
+                force_keyframe,
+            ).await?;
+        }
+        _ = video_pump_handle => {
+            tracing::info!("video pump ended");
+        }
+        _ = audio_pump_handle => {
+            tracing::info!("audio pump ended");
+        }
+    }
     Ok(())
 }
 
@@ -197,14 +235,25 @@ where
 /// broadcast for the fallback path.
 fn start_video_pump(
     track: Arc<TrackLocalStaticSample>,
+    quality: Quality,
 ) -> Result<(
     tokio::task::JoinHandle<()>,
-    tokio::sync::broadcast::Receiver<EncodedFrame>,
+    tokio::sync::broadcast::Sender<EncodedFrame>,
     Arc<AtomicBool>,
 )> {
-    let mut capture = VideoCapture::start(30)?;
-    let (bcast_tx, bcast_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(16);
-    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::unbounded_channel::<EncodedFrame>();
+    let mut capture = VideoCapture::start(quality.fps(), quality.resolution())?;
+    let bitrate_kbps = quality.bitrate_kbps();
+    let frame_duration = Duration::from_micros(1_000_000 / quality.fps() as u64);
+    // Returning the Sender (not the initial Receiver) so callers can subscribe
+    // at the moment they actually want a feed — used by the mid-stream-failure
+    // escalation, which has to spin up a fresh Receiver after `connected`.
+    let (bcast_tx, _) = tokio::sync::broadcast::channel::<EncodedFrame>(16);
+    // Bounded so a stalled forwarder (e.g. write_sample blocked against a
+    // failed WebRTC transport, or a slow relay WS) can't grow this without
+    // limit and OOM-kill the process. On Full we drop the new frame and ask
+    // the encoder to emit a fresh keyframe — the dropped P-frame was going
+    // to be undecodable downstream once we skipped anything anyway.
+    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::channel::<EncodedFrame>(16);
     // Flag the encoder thread polls before each encode. vpx-encode 0.5.0
     // doesn't expose VPX_EFLAG_FORCE_KF, but a freshly constructed Encoder
     // always emits a keyframe as its first packet — so to "force a keyframe"
@@ -245,7 +294,7 @@ fn start_video_pump(
                     width: frame.width,
                     height: frame.height,
                     timebase: [1, 1000],
-                    bitrate: 4_000,
+                    bitrate: bitrate_kbps,
                     codec: vpx_encode::VideoCodecId::VP8,
                 };
                 match vpx_encode::Encoder::new(cfg) {
@@ -285,38 +334,48 @@ fn start_video_pump(
                     timestamp_us: frame.timestamp_us,
                     data: pkt.data.to_vec(),
                 };
-                if enc_tx.send(ef).is_err() {
-                    return;
+                match enc_tx.try_send(ef) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        // Downstream is backpressured (stalled write_sample or
+                        // slow relay WS). Drop this packet; flip force_keyframe
+                        // so the next surviving frame is independently decodable.
+                        force_keyframe_thread.store(true, Ordering::Relaxed);
+                        tracing::warn!("encoder mpsc full — dropping frame");
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                 }
             }
         }
     });
 
+    let bcast_for_task = bcast_tx.clone();
     let handle = tokio::spawn(async move {
         while let Some(ef) = enc_rx.recv().await {
             let sample = webrtc::media::Sample {
                 data: ef.data.clone().into(),
-                duration: Duration::from_micros(33_333),
+                duration: frame_duration,
                 ..Default::default()
             };
             if let Err(e) = track.write_sample(&sample).await {
                 tracing::warn!("video track write failed: {e}");
             }
-            let _ = bcast_tx.send(ef);
+            let _ = bcast_for_task.send(ef);
         }
     });
 
-    Ok((handle, bcast_rx, force_keyframe))
+    Ok((handle, bcast_tx, force_keyframe))
 }
 
 /// Same pattern for audio: opus::Encoder is `!Send`, so the encode loop runs
 /// on an OS thread and forwards EncodedFrames to an async forwarder.
 fn start_audio_pump(
     track: Arc<TrackLocalStaticSample>,
-) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::broadcast::Receiver<EncodedFrame>)> {
+) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::broadcast::Sender<EncodedFrame>)> {
     let mut capture = AudioCapture::start()?;
-    let (bcast_tx, bcast_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(64);
-    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::unbounded_channel::<EncodedFrame>();
+    let (bcast_tx, _) = tokio::sync::broadcast::channel::<EncodedFrame>(64);
+    // Bounded for the same reason as the video pump (see start_video_pump).
+    let (enc_tx, mut enc_rx) = tokio::sync::mpsc::channel::<EncodedFrame>(32);
     let channels = capture.channels as usize;
     let sample_rate = capture.sample_rate;
 
@@ -365,8 +424,14 @@ fn start_audio_pump(
                     timestamp_us: frame.timestamp_us,
                     data: out[..n].to_vec(),
                 };
-                if enc_tx.send(ef).is_err() {
-                    return;
+                match enc_tx.try_send(ef) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        // Opus frames are independently decodable, so we just
+                        // drop the oldest by losing one — no keyframe equivalent.
+                        tracing::warn!("audio mpsc full — dropping frame");
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                 }
             }
         }
@@ -376,6 +441,7 @@ fn start_audio_pump(
         tracing::warn!("audio capture ended — continuing without audio");
     });
 
+    let bcast_for_task = bcast_tx.clone();
     let handle = tokio::spawn(async move {
         while let Some(ef) = enc_rx.recv().await {
             let sample = webrtc::media::Sample {
@@ -386,11 +452,11 @@ fn start_audio_pump(
             if let Err(e) = track.write_sample(&sample).await {
                 tracing::warn!("audio track write failed: {e}");
             }
-            let _ = bcast_tx.send(ef);
+            let _ = bcast_for_task.send(ef);
         }
     });
 
-    Ok((handle, bcast_rx))
+    Ok((handle, bcast_tx))
 }
 
 #[derive(Clone)]

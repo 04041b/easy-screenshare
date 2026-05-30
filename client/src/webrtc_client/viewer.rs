@@ -123,7 +123,10 @@ pub async fn run_native(backend: &str, code: &str, pin: &str) -> Result<()> {
     let local = pc.local_description().await.context("no local desc")?;
     signaling.put_answer(&code, pin, &local.sdp).await?;
 
-    let connect_timeout = sleep(Duration::from_secs(15));
+    // Match the sender's 4s budget (see sender.rs). A successful P2P handshake
+    // is sub-2s; anything longer is the sender stalling on DTLS and we should
+    // get to the relay quickly.
+    let connect_timeout = sleep(Duration::from_secs(4));
     tokio::pin!(connect_timeout);
     tokio::select! {
         _ = connected.notified() => {

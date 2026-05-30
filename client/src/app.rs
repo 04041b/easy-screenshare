@@ -4,10 +4,11 @@ use eframe::egui;
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
+use crate::capture::Quality;
 use crate::webrtc_client;
 use crate::webrtc_client::sender::ShareInfo;
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct UiState {
     share_url: Option<String>,
     share_pin: Option<String>,
@@ -15,6 +16,21 @@ struct UiState {
     sharing: bool,
     view_code_input: String,
     view_pin_input: String,
+    quality: Quality,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            share_url: None,
+            share_pin: None,
+            error: None,
+            sharing: false,
+            view_code_input: String::new(),
+            view_pin_input: String::new(),
+            quality: Quality::default(),
+        }
+    }
 }
 
 pub fn run_gui(rt: Runtime, backend: String) -> anyhow::Result<()> {
@@ -73,6 +89,7 @@ impl eframe::App for App {
 
         let mut next_code = snap.view_code_input.clone();
         let mut next_pin = snap.view_pin_input.clone();
+        let mut next_quality = snap.quality;
         let mut want_share = false;
         let mut want_watch = false;
         let mut want_copy_url = false;
@@ -84,6 +101,7 @@ impl eframe::App for App {
 
             if snap.sharing {
                 ui.label("Sharing your screen.");
+                ui.label(format!("Quality: {}", snap.quality.label()));
                 if let Some(url) = &snap.share_url {
                     ui.add_space(8.0);
                     ui.label("Viewer URL:");
@@ -115,6 +133,24 @@ impl eframe::App for App {
             } else {
                 ui.label("Share your screen, or view someone else's.");
                 ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label("Quality:");
+                    egui::ComboBox::from_id_source("quality-picker")
+                        .selected_text(next_quality.label())
+                        .show_ui(ui, |ui| {
+                            for q in [Quality::Low, Quality::Medium, Quality::High] {
+                                ui.selectable_value(&mut next_quality, q, q.label());
+                            }
+                        });
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Lower quality reduces lag on slow networks and on the relay fallback path."
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(8.0);
                 if ui.button("Share my screen").clicked() {
                     want_share = true;
                 }
@@ -150,6 +186,9 @@ impl eframe::App for App {
             if s.view_pin_input != next_pin {
                 s.view_pin_input = next_pin;
             }
+            if s.quality != next_quality {
+                s.quality = next_quality;
+            }
         }
 
         if want_copy_url {
@@ -168,10 +207,11 @@ impl eframe::App for App {
             let backend = self.backend.clone();
             let state = self.state.clone();
             let ctx2 = ctx.clone();
+            let quality = next_quality;
             self.rt.spawn(async move {
                 let cb_state = state.clone();
                 let cb_ctx = ctx2.clone();
-                match webrtc_client::sender::run_with_callbacks(&backend, move |info: ShareInfo| {
+                match webrtc_client::sender::run_with_callbacks(&backend, quality, move |info: ShareInfo| {
                     let mut s = cb_state.lock();
                     s.share_url = Some(info.viewer_url);
                     s.share_pin = Some(info.pin);
