@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -156,7 +157,7 @@ where
 
     // 7. Start media pumps now — encoder threads write to tracks regardless of P2P state;
     //    fallback path reuses the same encoded frames over WS if WebRTC fails.
-    let (video_pump_handle, video_tap) = start_video_pump(video_track.clone())?;
+    let (video_pump_handle, video_tap, force_keyframe) = start_video_pump(video_track.clone())?;
     let (audio_pump_handle, audio_tap) = start_audio_pump(audio_track.clone())?;
 
     // 8. Watch for connection result; on failure, escalate to WS relay
@@ -170,12 +171,18 @@ where
         _ = failed.notified() => {
             tracing::warn!("WebRTC failed, escalating to fallback relay");
             signaling.put_fallback(&session.id, &session.sender_token).await?;
-            fallback::run_sender(backend, &session.id, &session.sender_token, video_tap, audio_tap).await?;
+            // The encoder has been running since step 7 with a tiny 16-slot
+            // broadcast buffer; the fallback receiver will almost certainly
+            // come up Lagged past the only keyframe scap produced at start.
+            // Force a fresh keyframe so the late subscriber can decode.
+            force_keyframe.store(true, Ordering::Relaxed);
+            fallback::run_sender(backend, &session.id, &session.sender_token, video_tap, audio_tap, force_keyframe).await?;
         }
         _ = &mut connect_timeout => {
             tracing::warn!("WebRTC connect timeout, escalating to fallback relay");
             signaling.put_fallback(&session.id, &session.sender_token).await?;
-            fallback::run_sender(backend, &session.id, &session.sender_token, video_tap, audio_tap).await?;
+            force_keyframe.store(true, Ordering::Relaxed);
+            fallback::run_sender(backend, &session.id, &session.sender_token, video_tap, audio_tap, force_keyframe).await?;
         }
     }
 
@@ -190,10 +197,21 @@ where
 /// broadcast for the fallback path.
 fn start_video_pump(
     track: Arc<TrackLocalStaticSample>,
-) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::broadcast::Receiver<EncodedFrame>)> {
+) -> Result<(
+    tokio::task::JoinHandle<()>,
+    tokio::sync::broadcast::Receiver<EncodedFrame>,
+    Arc<AtomicBool>,
+)> {
     let mut capture = VideoCapture::start(30)?;
     let (bcast_tx, bcast_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(16);
     let (enc_tx, mut enc_rx) = tokio::sync::mpsc::unbounded_channel::<EncodedFrame>();
+    // Flag the encoder thread polls before each encode. vpx-encode 0.5.0
+    // doesn't expose VPX_EFLAG_FORCE_KF, but a freshly constructed Encoder
+    // always emits a keyframe as its first packet — so to "force a keyframe"
+    // we drop and recreate the encoder. Used by the fallback path because a
+    // late WS subscriber will have missed the encoder's only natural keyframe.
+    let force_keyframe = Arc::new(AtomicBool::new(false));
+    let force_keyframe_thread = Arc::clone(&force_keyframe);
 
     std::thread::spawn(move || {
         let mut encoder: Option<vpx_encode::Encoder> = None;
@@ -216,6 +234,10 @@ fn start_video_pump(
                     );
                 }
                 continue;
+            }
+            if force_keyframe_thread.swap(false, Ordering::Relaxed) {
+                tracing::info!("force_keyframe set — reinitialising encoder");
+                encoder = None;
             }
             if encoder.is_none() || enc_w != frame.width || enc_h != frame.height {
                 tracing::info!(w = frame.width, h = frame.height, "initializing VP8 encoder");
@@ -284,7 +306,7 @@ fn start_video_pump(
         }
     });
 
-    Ok((handle, bcast_rx))
+    Ok((handle, bcast_rx, force_keyframe))
 }
 
 /// Same pattern for audio: opus::Encoder is `!Send`, so the encode loop runs

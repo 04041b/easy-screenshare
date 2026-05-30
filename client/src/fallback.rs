@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -28,6 +31,7 @@ pub async fn run_sender(
     token: &str,
     mut video: broadcast::Receiver<EncodedFrame>,
     mut audio: broadcast::Receiver<EncodedFrame>,
+    force_keyframe: Arc<AtomicBool>,
 ) -> Result<()> {
     let url = ws_url(backend, id, "sender", Some(token), None);
     tracing::info!(%url, "opening sender relay ws");
@@ -84,8 +88,12 @@ pub async fn run_sender(
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(n, "video relay lagged");
                         // After a lag we may have skipped past a keyframe;
-                        // force the next decision back through the gate.
+                        // force the next decision back through the gate, and
+                        // ask the encoder to emit a fresh keyframe so we can
+                        // resync — without this the loop sits here forever
+                        // because VP8 deltas can't decode standalone.
                         seen_keyframe = false;
+                        force_keyframe.store(true, Ordering::Relaxed);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
