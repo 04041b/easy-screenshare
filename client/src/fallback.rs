@@ -21,10 +21,20 @@ const MIN_BITRATE_KBPS: u32 = 250;
 /// telling us its send buffer is full. Treated as a congestion signal.
 const BACKPRESSURE_LATENCY_MS: u64 = 100;
 
-/// Drop P-frames older than this when we're behind. 150ms ≈ 4.5 frames at
-/// 30fps; beyond that the viewer is watching the past, not the present.
-/// Keyframes are kept regardless because they unblock the decoder.
-const FRAME_AGE_DROP_MS: u64 = 150;
+/// Drop ANY frame older than this when we're behind. 100ms ≈ 3 frames at
+/// 30 fps; past that the viewer is watching the past. Keyframes are
+/// dropped too — a "fresh" keyframe that took 2s to push through the
+/// pipeline is still stale, and sending it just commits the viewer to
+/// 2s of old content before catch-up. We force a fresh keyframe instead
+/// and wait for one that's actually recent.
+const FRAME_AGE_DROP_MS: u64 = 100;
+
+/// Cap the kernel TCP send buffer so that the OS doesn't silently absorb
+/// many seconds of frames while `sink.send().await` returns instantly.
+/// 64 KB ≈ 500 ms of buffering at 1 Mbps, ~120 ms at 4 Mbps — small
+/// enough that real backpressure shows up in our latency probe quickly,
+/// large enough not to bottleneck on a healthy link.
+const TCP_SEND_BUFFER_BYTES: u32 = 64 * 1024;
 
 /// AIMD multiplier on backpressure / drop signals. 0.75 = cut by a quarter.
 const AIMD_DECREASE: f32 = 0.75;
@@ -70,6 +80,18 @@ pub async fn run_sender(
     let url = ws_url(backend, id, "sender", Some(token), None);
     tracing::info!(%url, max_bitrate_kbps, "opening sender relay ws");
     let (ws, _) = connect_async(&url).await.context("ws connect")?;
+
+    // Cap the kernel TCP send buffer. Without this, the OS happily absorbs
+    // many megabytes (tens of seconds at our bitrates) into its send queue,
+    // so `sink.send().await` returns immediately even when the network is
+    // far behind — the AIMD controller never sees the backpressure and the
+    // viewer ends up replaying the past. With a 64KB cap, sink.send blocks
+    // as soon as the link can't keep up, the latency probe fires, and the
+    // controller cuts bitrate within ~500ms.
+    if let Err(e) = set_send_buffer_cap(&ws, TCP_SEND_BUFFER_BYTES) {
+        tracing::debug!(?e, "could not cap TCP send buffer; continuing");
+    }
+
     let (mut sink, mut stream) = ws.split();
 
     let cfg = RelayConfig {
@@ -235,12 +257,14 @@ pub async fn run_sender(
                         let frame_inst = anchor_inst
                             + Duration::from_micros(f.timestamp_us.saturating_sub(anchor_ts));
                         let age = Instant::now().saturating_duration_since(frame_inst);
-                        if !f.keyframe && age >= Duration::from_millis(FRAME_AGE_DROP_MS) {
+                        if age >= Duration::from_millis(FRAME_AGE_DROP_MS) {
                             drops.fetch_add(1, Ordering::Relaxed);
-                            // Stale P-frame implies the next one would be
-                            // stale too. Request a fresh keyframe and skip
-                            // until we see it so the receiver doesn't try to
-                            // decode against a missing reference.
+                            // Drop *anything* stale, keyframe included. A
+                            // late keyframe is the worst of both worlds: we
+                            // pay the full bitrate spike *and* commit the
+                            // viewer to N seconds of historical content
+                            // before catch-up. Better to drop and wait for
+                            // the encoder's next fresh keyframe.
                             seen_keyframe = false;
                             force_keyframe.store(true, Ordering::Relaxed);
                             continue;
@@ -329,6 +353,28 @@ pub async fn run_viewer(backend: &str, id: &str, pin: &str, sink: FrameSink) -> 
         }
     }
     Ok(())
+}
+
+/// Reach through tokio-tungstenite's `MaybeTlsStream` and tokio-rustls's
+/// `TlsStream` to set `SO_SNDBUF` on the underlying TCP socket. Best-effort
+/// — falls through silently if a future `MaybeTlsStream` variant becomes
+/// reachable that we don't recognise, in which case the age-based dropping
+/// still bounds lag (just less tightly).
+fn set_send_buffer_cap(
+    ws: &tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    bytes: u32,
+) -> std::io::Result<()> {
+    use tokio_tungstenite::MaybeTlsStream;
+    let tcp: &tokio::net::TcpStream = match ws.get_ref() {
+        MaybeTlsStream::Plain(s) => s,
+        MaybeTlsStream::Rustls(s) => s.get_ref().0,
+        _ => return Ok(()),
+    };
+    // tokio's TcpStream doesn't expose set_send_buffer_size; route through
+    // socket2 which calls setsockopt(SO_SNDBUF) cross-platform.
+    socket2::SockRef::from(tcp).set_send_buffer_size(bytes as usize)
 }
 
 fn frame_to_bytes(f: &EncodedFrame) -> Vec<u8> {
