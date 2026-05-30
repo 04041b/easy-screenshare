@@ -31,20 +31,25 @@ parking_lot = "0.12"
 bytes = "1"
 socket2 = "0.5"
 
-scap = "0.0.8"
 cpal = "0.15"
-
 webrtc = "0.11"
 vpx-encode = "0.5"
 env-libvpx-sys = { version = "5.1", features = ["generate"] }
 opus = "0.3"
 
+# scap covers screen capture on macOS and Linux. On Windows we go direct to
+# windows-capture — scap 0.0.8's Windows wrapper silently ignored
+# `output_resolution` (forcing client-side downscaling) and was pinned to an
+# old windows-capture release blocking us from upstream fixes.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+scap = "0.0.8"
+
 [target.'cfg(target_os = "windows")'.dependencies]
-# scap 0.0.8's Windows backend straddles two windows-capture API eras:
-# it uses `capture::Context` and `FrameBuffer::as_nopadding_buffer` (added
-# in 1.4) but also calls Settings::new with 5 args (which became 8 in 1.5).
-# 1.4.4 is the last release that has both shapes.
-windows-capture = "=1.4.4"
+# Going direct lets us track latest and gives us cleaner ownership over the
+# capture surface (handler trait, CaptureControl for shutdown, real frame
+# metadata). Audio isn't part of this crate's capture path — we keep wasapi
+# for loopback audio.
+windows-capture = "2"
 # cpal opens the default render device as an input but never sets
 # AUDCLNT_STREAMFLAGS_LOOPBACK, so callbacks never fire and we get no audio.
 # wasapi exposes the loopback flag directly via Direction::Capture on a

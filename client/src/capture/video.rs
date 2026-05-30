@@ -1,13 +1,22 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(not(target_os = "windows"))]
+use anyhow::Context;
+#[cfg(not(target_os = "windows"))]
 use parking_lot::Mutex;
+#[cfg(not(target_os = "windows"))]
 use scap::{
-    capturer::{Capturer, Options, Resolution},
+    capturer::{Capturer, Options},
     frame::Frame,
 };
+#[cfg(not(target_os = "windows"))]
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(not(target_os = "windows"))]
+use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::mpsc;
+
+use super::Resolution;
 
 /// One captured video frame in BGRA8 layout.
 #[derive(Clone)]
@@ -21,11 +30,34 @@ pub struct VideoFrame {
 
 pub struct VideoCapture {
     pub rx: mpsc::Receiver<VideoFrame>,
+    // Kept alive for the lifetime of the capture. On scap-backed builds it's
+    // the emitter thread's handle (the reader thread runs free-form and
+    // self-exits when the mpsc sender drops). On the windows-capture build
+    // it's the CaptureControl handle returned by start_free_threaded; the
+    // handler's on_frame_arrived stops the capture when its mpsc Sender goes.
+    #[cfg(not(target_os = "windows"))]
     _join: thread::JoinHandle<()>,
+    #[cfg(target_os = "windows")]
+    _capture_control: windows_capture::capture::CaptureControl<
+        windows_impl::Handler,
+        anyhow::Error,
+    >,
 }
 
 impl VideoCapture {
     pub fn start(target_fps: u32, target_resolution: Resolution) -> Result<Self> {
+        #[cfg(target_os = "windows")]
+        {
+            windows_impl::start(target_fps, target_resolution)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self::start_scap(target_fps, target_resolution)
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn start_scap(target_fps: u32, target_resolution: Resolution) -> Result<Self> {
         if !scap::is_supported() {
             anyhow::bail!("screen capture is not supported on this platform/version");
         }
@@ -73,13 +105,9 @@ impl VideoCapture {
 
         let latest_writer = latest.clone();
         let reader_fps = target_fps;
-        let reader_res = target_resolution;
+        let reader_res: scap::capturer::Resolution = target_resolution.into();
         let reader = thread::spawn(move || {
             super::lower_thread_priority_for_background_work();
-            // Build the Capturer inside the thread. On Windows, scap's
-            // Options contains Option<Target> where Target::Window holds an
-            // HWND(*mut c_void) — making Options unconditionally !Send.
-            // Constructing here keeps the !Send value confined to one thread.
             let opts = Options {
                 fps: reader_fps,
                 show_cursor: true,
@@ -92,7 +120,6 @@ impl VideoCapture {
             capturer.start_capture();
             let start = Instant::now();
             let mut first_logged = false;
-            let mut scaled_log_done = false;
             let mut empties_in_a_row = 0u32;
             loop {
                 let frame = match capturer.get_next_frame() {
@@ -121,48 +148,11 @@ impl VideoCapture {
                             tracing::info!(w, h, bytes = b.data.len(), "first BGRA frame from scap");
                             first_logged = true;
                         }
-                        // scap's Windows backend (windows-capture) silently
-                        // ignores `output_resolution`, so we get the native
-                        // display size (e.g. 2560×1600 on a 16:10 laptop).
-                        // Encoding that at our preset bitrate is starvation
-                        // and triggers a lag/keyframe thrash spiral. Downscale
-                        // here to the requested resolution; on backends that
-                        // honored the request this becomes a no-op.
-                        // `Resolution::value()` is private in scap, so duplicate
-                        // its width table. Height tracks the source aspect ratio
-                        // and is even-aligned because VP8 requires even dims.
-                        let target_w: u32 = match reader_res {
-                            Resolution::_480p => 640,
-                            Resolution::_720p => 1280,
-                            Resolution::_1080p => 1920,
-                            Resolution::_1440p => 2560,
-                            Resolution::_2160p => 3840,
-                            Resolution::_4320p => 7680,
-                            _ => 0,
-                        };
-                        let target_h: u32 = if target_w == 0 || w == 0 {
-                            0
-                        } else {
-                            let h_calc = (target_w as u64 * h as u64 / w as u64) as u32;
-                            h_calc & !1
-                        };
-                        let tw = target_w & !1;
-                        let th = target_h;
-                        let (final_w, final_h, final_data) = if tw > 0 && th > 0 && tw < w && th < h && tw >= 16 && th >= 16 {
-                            let scaled = downscale_bgra(&b.data, w, h, tw, th);
-                            if !scaled_log_done {
-                                tracing::info!(src_w = w, src_h = h, dst_w = tw, dst_h = th, "downscaling capture in-process (scap backend did not honor output_resolution)");
-                                scaled_log_done = true;
-                            }
-                            (tw, th, scaled)
-                        } else {
-                            (w, h, b.data)
-                        };
                         *latest_writer.lock() = Some(VideoFrame {
-                            width: final_w,
-                            height: final_h,
-                            stride: final_w * 4,
-                            data: final_data,
+                            width: w,
+                            height: h,
+                            stride: w * 4,
+                            data: b.data,
                             timestamp_us: ts_us,
                         });
                     }
@@ -200,15 +190,16 @@ impl VideoCapture {
 
         Ok(Self { rx, _join: emitter })
     }
-
 }
 
-/// Nearest-neighbor BGRA downscale. Chosen for speed over visual quality —
-/// screen content is mostly low-frequency (UI, text glyphs) so the artefacts
-/// are tolerable, and the VP8 encoder further smooths what's left. A box
-/// filter would be ~4× slower per pixel and we're already on the hot path
-/// at ~30 fps × multi-megapixel frames. `stride_bytes` lets us skip any row
-/// padding the capturer adds; pass `src_w * 4` when there's none.
+/// Nearest-neighbor BGRA downscale. Used by the Windows path because
+/// `windows-capture`'s Direct3D-backed capture surface doesn't natively
+/// scale output, so we shrink in software here. Chosen for speed over
+/// visual quality — screen content is mostly low-frequency (UI, text
+/// glyphs) so the artefacts are tolerable, and the VP8 encoder further
+/// smooths what's left. A box filter would be ~4× slower per pixel and
+/// we're already on the hot path at ~30 fps × multi-megapixel frames.
+#[cfg(target_os = "windows")]
 fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     let stride_bytes = (src_w * 4) as usize;
     let dst_row_bytes = (dst_w * 4) as usize;
@@ -229,22 +220,163 @@ fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) ->
     dst
 }
 
-pub fn primary_resolution() -> Result<(u32, u32)> {
-    // scap doesn't expose target enumeration here uniformly; pick 1080p as default request.
-    // Real resolution comes from the first frame.
-    Ok((1920, 1080))
-}
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    //! Windows screen capture via the `windows-capture` crate directly,
+    //! bypassing scap (whose Windows wrapper silently ignored
+    //! `output_resolution` and was version-pinned to an old release).
+    //!
+    //! The handler trait runs on a dedicated thread managed by
+    //! windows-capture; we push BGRA frames into the same `tokio::mpsc`
+    //! channel the scap path uses, so the rest of the pipeline is unchanged.
 
-pub fn touch() -> Result<()> {
-    // Cheap sanity-check helper for tests.
-    if !scap::is_supported() {
-        anyhow::bail!("capture not supported");
+    use super::{downscale_bgra, Resolution, VideoCapture, VideoFrame};
+    use anyhow::Result;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+    use windows_capture::{
+        capture::{Context, GraphicsCaptureApiHandler},
+        frame::Frame,
+        graphics_capture_api::InternalCaptureControl,
+        monitor::Monitor,
+        settings::{
+            ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+            MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+        },
+    };
+
+    pub struct HandlerFlags {
+        pub tx: mpsc::Sender<VideoFrame>,
+        pub target_width: u32,
     }
-    Ok(())
-}
 
-#[allow(dead_code)]
-fn _unused() -> Result<()> {
-    let _ = primary_resolution().context("res")?;
-    Ok(())
+    pub struct Handler {
+        tx: mpsc::Sender<VideoFrame>,
+        target_width: u32,
+        start: Instant,
+        first_logged: bool,
+        scaled_log_done: bool,
+        nopad_buf: Vec<u8>,
+    }
+
+    impl GraphicsCaptureApiHandler for Handler {
+        type Flags = HandlerFlags;
+        type Error = anyhow::Error;
+
+        fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+            crate::capture::lower_thread_priority_for_background_work();
+            Ok(Self {
+                tx: ctx.flags.tx,
+                target_width: ctx.flags.target_width,
+                start: Instant::now(),
+                first_logged: false,
+                scaled_log_done: false,
+                nopad_buf: Vec::new(),
+            })
+        }
+
+        fn on_frame_arrived(
+            &mut self,
+            frame: &mut Frame,
+            control: InternalCaptureControl,
+        ) -> Result<(), Self::Error> {
+            let w = frame.width();
+            let h = frame.height();
+            let ts_us = self.start.elapsed().as_micros() as u64;
+
+            // BGRA bytes with row padding stripped. The returned slice
+            // borrows from `nopad_buf` so we can't move it out — copy
+            // into the VideoFrame's owned Vec.
+            let raw: &[u8] = frame.as_nopadding_buffer(&mut self.nopad_buf);
+
+            if !self.first_logged {
+                tracing::info!(
+                    w, h, bytes = raw.len(),
+                    "first BGRA frame from windows-capture"
+                );
+                self.first_logged = true;
+            }
+
+            // Downscale if the source is larger than the requested width.
+            // windows-capture has no native output_resolution scaling, so
+            // we do it in software here. VP8 requires even dimensions.
+            let tw = self.target_width & !1;
+            let th = if tw > 0 && w > 0 {
+                ((tw as u64 * h as u64 / w as u64) as u32) & !1
+            } else {
+                0
+            };
+
+            let (final_w, final_h, data): (u32, u32, Vec<u8>) =
+                if tw > 0 && th > 0 && tw < w && th < h && tw >= 16 && th >= 16 {
+                    let scaled = downscale_bgra(raw, w, h, tw, th);
+                    if !self.scaled_log_done {
+                        tracing::info!(
+                            src_w = w, src_h = h, dst_w = tw, dst_h = th,
+                            "downscaling capture in-process"
+                        );
+                        self.scaled_log_done = true;
+                    }
+                    (tw, th, scaled)
+                } else {
+                    (w, h, raw.to_vec())
+                };
+
+            let vf = VideoFrame {
+                width: final_w,
+                height: final_h,
+                stride: final_w * 4,
+                data,
+                timestamp_us: ts_us,
+            };
+            // blocking_send back-pressures naturally: when the encoder is
+            // behind, the WGC thread stalls here, which makes WGC drop
+            // older frames internally rather than queueing them on us.
+            if self.tx.blocking_send(vf).is_err() {
+                tracing::info!("video mpsc closed — stopping windows-capture");
+                control.stop();
+            }
+            Ok(())
+        }
+
+        fn on_closed(&mut self) -> Result<(), Self::Error> {
+            tracing::info!("windows-capture session closed");
+            Ok(())
+        }
+    }
+
+    pub fn start(target_fps: u32, target_resolution: Resolution) -> Result<VideoCapture> {
+        let (tx, rx) = mpsc::channel::<VideoFrame>(8);
+
+        let monitor = Monitor::primary()
+            .map_err(|e| anyhow::anyhow!("get primary monitor: {e:?}"))?;
+
+        // MinimumUpdateInterval caps WGC's *own* delivery rate. We've been
+        // burning CPU+GPU bandwidth doing 60 fps GPU→CPU copies that the
+        // encoder threw away. Telling WGC the floor lets it skip the copy
+        // entirely between frames. Custom interval = 1 / target_fps.
+        let interval = Duration::from_micros(1_000_000 / target_fps.max(1) as u64);
+
+        let settings = Settings::new(
+            monitor,
+            CursorCaptureSettings::Default,
+            DrawBorderSettings::Default,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Custom(interval),
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            HandlerFlags {
+                tx,
+                target_width: target_resolution.width(),
+            },
+        );
+
+        let control = Handler::start_free_threaded(settings)
+            .map_err(|e| anyhow::anyhow!("windows-capture start: {e:?}"))?;
+
+        Ok(VideoCapture {
+            rx,
+            _capture_control: control,
+        })
+    }
 }
