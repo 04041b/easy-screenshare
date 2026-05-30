@@ -283,44 +283,56 @@ mod windows_impl {
             let w = frame.width();
             let h = frame.height();
             let ts_us = self.start.elapsed().as_micros() as u64;
+            let target_width = self.target_width;
 
-            // BGRA bytes with row padding stripped. The returned slice
-            // borrows from `nopad_buf` so we can't move it out — copy
-            // into the VideoFrame's owned Vec.
-            let raw: &[u8] = frame.as_nopadding_buffer(&mut self.nopad_buf);
+            // Capture the decisions we want to make about logging up-front
+            // so we don't need to mutate self while the frame buffer is
+            // borrowing self.nopad_buf below.
+            let was_first = !self.first_logged;
+            let was_first_scaled = !self.scaled_log_done;
 
-            if !self.first_logged {
-                tracing::info!(
-                    w, h, bytes = raw.len(),
-                    "first BGRA frame from windows-capture"
-                );
-                self.first_logged = true;
-            }
-
-            // Downscale if the source is larger than the requested width.
-            // windows-capture has no native output_resolution scaling, so
-            // we do it in software here. VP8 requires even dimensions.
-            let tw = self.target_width & !1;
+            // VP8 requires even dimensions. windows-capture has no native
+            // output_resolution scaling, so we shrink in software here.
+            let tw = target_width & !1;
             let th = if tw > 0 && w > 0 {
                 ((tw as u64 * h as u64 / w as u64) as u32) & !1
             } else {
                 0
             };
+            let should_scale =
+                tw > 0 && th > 0 && tw < w && th < h && tw >= 16 && th >= 16;
 
-            let (final_w, final_h, data): (u32, u32, Vec<u8>) =
-                if tw > 0 && th > 0 && tw < w && th < h && tw >= 16 && th >= 16 {
-                    let scaled = downscale_bgra(raw, w, h, tw, th);
-                    if !self.scaled_log_done {
-                        tracing::info!(
-                            src_w = w, src_h = h, dst_w = tw, dst_h = th,
-                            "downscaling capture in-process"
-                        );
-                        self.scaled_log_done = true;
-                    }
-                    (tw, th, scaled)
+            // Borrow scope: get the BGRA bytes via FrameBuffer, then either
+            // downscale into a fresh Vec or copy into one. The FrameBuffer
+            // and its returned slice both go out of scope at the end of the
+            // block, releasing the borrow on self.nopad_buf so we can mutate
+            // self.first_logged / scaled_log_done after.
+            let (final_w, final_h, data): (u32, u32, Vec<u8>) = {
+                let mut fb = frame
+                    .buffer()
+                    .map_err(|e| anyhow::anyhow!("frame.buffer: {e:?}"))?;
+                let raw = fb.as_nopadding_buffer(&mut self.nopad_buf);
+                if should_scale {
+                    (tw, th, downscale_bgra(raw, w, h, tw, th))
                 } else {
                     (w, h, raw.to_vec())
-                };
+                }
+            };
+
+            if was_first {
+                tracing::info!(
+                    w = final_w, h = final_h, bytes = data.len(),
+                    "first BGRA frame from windows-capture"
+                );
+                self.first_logged = true;
+            }
+            if should_scale && was_first_scaled {
+                tracing::info!(
+                    src_w = w, src_h = h, dst_w = tw, dst_h = th,
+                    "downscaling capture in-process"
+                );
+                self.scaled_log_done = true;
+            }
 
             let vf = VideoFrame {
                 width: final_w,
