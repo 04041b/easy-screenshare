@@ -36,6 +36,32 @@ impl VideoCapture {
             }
         }
 
+        // Pre-flight the shareable content. On macOS, `has_permission()` can
+        // report a stale `true` (the TCC grant is keyed to the executable, so a
+        // rebuilt binary loses it even though a cached check says otherwise).
+        // In that state `SCShareableContent::current()` returns zero displays,
+        // and scap's `Capturer::new` does `.find(main_display).unwrap()` on the
+        // empty list — panicking deep inside the crate. Because the release
+        // profile sets `panic = "abort"`, that panic takes down the whole
+        // process, the relay/WebRTC WS closes, and the viewer sees a black
+        // screen. Convert that abort into an actionable error here, before scap
+        // can reach its unwrap.
+        let display_count = scap::get_all_targets()
+            .into_iter()
+            .filter(|t| matches!(t, scap::Target::Display(_)))
+            .count();
+        if display_count == 0 {
+            #[cfg(target_os = "macos")]
+            anyhow::bail!(
+                "no capturable displays — macOS Screen Recording permission is not \
+                 effectively granted to this binary. Open System Settings ▸ Privacy & \
+                 Security ▸ Screen Recording, toggle this executable off then on (or \
+                 remove and re-add it), and relaunch."
+            );
+            #[cfg(not(target_os = "macos"))]
+            anyhow::bail!("no capturable displays found — screen capture cannot start");
+        }
+
         let (tx, rx) = mpsc::channel::<VideoFrame>(8);
 
         // Latest valid frame, shared between the scap reader thread (writer)
@@ -133,6 +159,7 @@ impl VideoCapture {
 
         Ok(Self { rx, _join: emitter })
     }
+
 }
 
 pub fn primary_resolution() -> Result<(u32, u32)> {

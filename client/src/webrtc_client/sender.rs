@@ -370,6 +370,10 @@ fn start_audio_pump(
                 }
             }
         }
+        // Audio capture stopped delivering (no input device, permission denied,
+        // or the stream ended). The relay treats audio as best-effort, so just
+        // let this thread finish; the broadcast closing is handled downstream.
+        tracing::warn!("audio capture ended — continuing without audio");
     });
 
     let handle = tokio::spawn(async move {

@@ -50,6 +50,14 @@ pub async fn run_sender(
     // preceding keyframe, so suppress video sends until we see a keyframe.
     let mut seen_keyframe = false;
 
+    // Audio is best-effort and may never start (no input device, system-audio
+    // capture unavailable, permission denied). When that happens the audio
+    // capture thread ends, its broadcast sender drops, and `audio.recv()`
+    // returns `Closed`. That must NOT tear down the video relay — otherwise a
+    // missing microphone makes the viewer see a permanently black screen. Gate
+    // the audio branch so it is disabled (not fatal) once audio ends.
+    let mut audio_open = true;
+
     loop {
         tokio::select! {
             // Poll the read side too. tokio-tungstenite only auto-responds to
@@ -83,7 +91,10 @@ pub async fn run_sender(
                                 continue;
                             }
                         }
-                        sink.send(Message::Binary(frame_to_bytes(&f))).await?;
+                        if let Err(e) = sink.send(Message::Binary(frame_to_bytes(&f))).await {
+                            tracing::warn!("video relay send err: {e}");
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(n, "video relay lagged");
@@ -98,15 +109,22 @@ pub async fn run_sender(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            a = audio.recv() => {
+            a = audio.recv(), if audio_open => {
                 match a {
                     Ok(f) => {
-                        sink.send(Message::Binary(frame_to_bytes(&f))).await?;
+                        if let Err(e) = sink.send(Message::Binary(frame_to_bytes(&f))).await {
+                            tracing::warn!("audio relay send err: {e}");
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(n, "audio relay lagged");
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Audio ended; keep relaying video only.
+                        tracing::warn!("audio capture unavailable — relaying video without audio");
+                        audio_open = false;
+                    }
                 }
             }
         }
