@@ -283,7 +283,20 @@ fn start_video_pump(
         let mut t0_us: Option<u64> = None;
         let mut frames_seen = 0u64;
 
-        while let Some(frame) = capture.rx.blocking_recv() {
+        while let Some(mut frame) = capture.rx.blocking_recv() {
+            // Drain any frames that piled up while we were busy with the
+            // previous encode and keep only the freshest. For realtime
+            // screen sharing the older frames are useless — their
+            // capture timestamps are minutes behind wall-clock by the time
+            // the encoder catches up, and the relay's age check then
+            // drops every one of them. Without this drain, a transient
+            // backpressure spike puts us in a permanent thrash where
+            // every encoder re-init produces a fresh keyframe stamped
+            // with a stale backlog time, which the relay then drops,
+            // triggering another re-init, forever.
+            while let Ok(newer) = capture.rx.try_recv() {
+                frame = newer;
+            }
             frames_seen += 1;
             // VP8 needs even dimensions and non-zero size. scap can deliver
             // garbage frames before permission is fully granted on macOS —
