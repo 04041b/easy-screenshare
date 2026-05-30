@@ -45,6 +45,14 @@ export class RelayRoom {
       if (lastConfig) {
         try { server.send(lastConfig); } catch {}
       }
+      // VP8 P-frames are useless to a freshly-configured decoder, and
+      // libvpx with our settings doesn't emit natural keyframes — so any
+      // viewer that joins mid-stream would otherwise sit on a black
+      // canvas until a lag spike (or share restart) coincidentally forced
+      // one. Ping every attached sender to emit a fresh keyframe now.
+      for (const ws of this.state.getWebSockets("sender")) {
+        try { ws.send(JSON.stringify({ v: 1, cmd: "keyframe" })); } catch {}
+      }
     }
 
     await this.bumpIdleAlarm();

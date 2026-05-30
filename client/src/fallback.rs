@@ -50,6 +50,13 @@ struct AudioConfig {
     channels: u16,
 }
 
+#[derive(Deserialize)]
+struct RelayCmd {
+    #[allow(dead_code)]
+    v: Option<u32>,
+    cmd: Option<String>,
+}
+
 pub async fn run_sender(
     backend: &str,
     id: &str,
@@ -174,6 +181,25 @@ pub async fn run_sender(
             // errors as a clean break.
             msg = stream.next() => {
                 match msg {
+                    Some(Ok(Message::Text(t))) => {
+                        // The DO sends control messages (e.g. keyframe
+                        // requests on new viewer attach) as JSON text.
+                        // Anything we don't recognise is logged and
+                        // ignored so future commands degrade gracefully.
+                        if let Ok(cmd) = serde_json::from_str::<RelayCmd>(&t) {
+                            match cmd.cmd.as_deref() {
+                                Some("keyframe") => {
+                                    tracing::info!("relay control: keyframe requested by DO");
+                                    force_keyframe.store(true, Ordering::Relaxed);
+                                }
+                                other => {
+                                    tracing::debug!(?other, "relay: unknown control cmd");
+                                }
+                            }
+                        } else {
+                            tracing::debug!(text = %t, "relay: unparseable text msg");
+                        }
+                    }
                     Some(Ok(Message::Close(frame))) => {
                         tracing::warn!(?frame, "relay closed by server");
                         break;

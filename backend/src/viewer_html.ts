@@ -272,6 +272,12 @@ export const VIEWER_HTML = `<!doctype html>
     let vdec = null, adec = null;
     let actx = null;
     let nextAudioTime = 0;
+    // VP8 P-frames can't be decoded without a preceding keyframe — feeding
+    // one to a freshly-configured VideoDecoder throws "a key frame is
+    // required after configure() or flush()" and corrupts the decoder for
+    // the rest of the session. Gate decode until we see the first keyframe,
+    // and ask the relay (which asks the sender) to produce one.
+    let seenKeyframe = false;
 
     ws.addEventListener('message', async (ev) => {
       if (typeof ev.data === 'string') {
@@ -329,11 +335,22 @@ export const VIEWER_HTML = `<!doctype html>
       const ts = Number(dv.getBigUint64(2, true));
       const payload = new Uint8Array(buf, 10);
       if (stream === 0 && vdec && vdec.state === 'configured') {
+        const isKey = (flags & 1) === 1;
+        if (!seenKeyframe) {
+          if (!isKey) {
+            // Drop silently until the first keyframe lands. The DO will have
+            // asked the sender for one on viewer-join; meanwhile we don't
+            // want to push a delta into the decoder.
+            return;
+          }
+          seenKeyframe = true;
+          setDbg('vdec', 'configured (key seen)');
+        }
         dbgState.wsFramesV++;
         setDbg('wsf', dbgState.wsFramesV + '/' + dbgState.wsFramesA);
         try {
           vdec.decode(new EncodedVideoChunk({
-            type: (flags & 1) ? 'key' : 'delta',
+            type: isKey ? 'key' : 'delta',
             timestamp: ts,
             data: payload,
           }));
