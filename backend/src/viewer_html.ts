@@ -224,7 +224,10 @@ export const VIEWER_HTML = `<!doctype html>
           settled = true; reject(new Error('webrtc failed: ' + pc.connectionState));
         }
       };
-      setTimeout(() => { if (!settled) { settled = true; reject(new Error('webrtc connect timeout')); } }, 15000);
+      // Match the sender's 4s budget. A working P2P handshake completes in
+      // well under 2s; waiting longer just keeps the viewer on a black screen
+      // while the sender is already trying to escalate to the relay.
+      setTimeout(() => { if (!settled) { settled = true; reject(new Error('webrtc connect timeout')); } }, 4000);
     });
 
     try {
