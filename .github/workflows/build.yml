@@ -157,6 +157,7 @@ jobs:
         run: |
           mkdir -p out
           cp "target/release/screenshare${{ matrix.ext }}" "out/screenshare-${{ matrix.label }}${{ matrix.ext }}"
+          zip -j "out/screenshare-${{ matrix.label }}.zip" "target/release/screenshare${{ matrix.ext }}"
           ls -lh out/
 
       - name: Upload binary
@@ -167,7 +168,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: screenshare-${{ matrix.label }}
-          path: client/out/screenshare-${{ matrix.label }}${{ matrix.ext }}
-          archive: false
+          path: |
+            client/out/screenshare-${{ matrix.label }}${{ matrix.ext }}
+            client/out/screenshare-${{ matrix.label }}.zip
           if-no-files-found: error
           retention-days: 14
