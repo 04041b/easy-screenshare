@@ -138,9 +138,14 @@ jobs:
           ls -lh out/
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        # archive: false (upload-artifact v7+) skips the default zip wrap so
+        # downloaders get the raw executable directly — no unzip step before
+        # `chmod +x && ./screenshare`. We only upload one file per job so
+        # there's nothing the archive was buying us.
+        uses: actions/upload-artifact@v7
         with:
           name: screenshare-${{ matrix.label }}
           path: client/out/screenshare-${{ matrix.label }}${{ matrix.ext }}
+          archive: false
           if-no-files-found: error
           retention-days: 14
