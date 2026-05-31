@@ -36,6 +36,23 @@ fn quality_resolution_matches_readme() {
 }
 
 #[test]
+fn original_bitrate_scales_with_capture_dimensions() {
+    // Fixed presets ignore dimensions and return their static bitrate.
+    assert_eq!(Quality::High.bitrate_kbps_for_capture(3840, 2160), 4_000);
+    assert_eq!(Quality::Ultra.bitrate_kbps_for_capture(3840, 2160), 8_000);
+
+    // Original below the 1080p crossover stays at the static floor.
+    assert_eq!(Quality::Original.bitrate_kbps_for_capture(1280, 720), 8_000);
+
+    // 4K30 lands around 24 Mbps at 0.10 bits/pixel/second.
+    let kbps_4k = Quality::Original.bitrate_kbps_for_capture(3840, 2160);
+    assert!((20_000..=28_000).contains(&kbps_4k), "4K30 got {kbps_4k}");
+
+    // 5K30 is clamped to the 40 Mbps ceiling.
+    assert_eq!(Quality::Original.bitrate_kbps_for_capture(5120, 2880), 40_000);
+}
+
+#[test]
 fn resolution_widths() {
     // `Native` returns None so the capture path uses the source display's
     // own width (no downscale). The Np presets carry their nominal width.

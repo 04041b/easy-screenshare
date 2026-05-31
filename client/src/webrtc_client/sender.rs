@@ -197,12 +197,21 @@ where
         // buffer; a late subscriber will Lag past the only keyframe scap
         // produced at start. Force a fresh keyframe so it can decode.
         force_keyframe.store(true, Ordering::Relaxed);
+        // AIMD ceiling = whatever the encoder thread has already
+        // published into the shared target. For `Original` that's the
+        // dimension-sized value (potentially ≫ 8 Mbps); for fixed
+        // presets it equals `quality.bitrate_kbps()`. The `.max(...)`
+        // guards the case where the encoder thread hasn't seen a frame
+        // before we engage the relay.
+        let max_kbps = target_bitrate_kbps
+            .load(Ordering::Relaxed)
+            .max(quality.bitrate_kbps());
         fallback::run_sender(
             backend, &session.id, &session.sender_token,
             video_bcast.subscribe(), audio_bcast.subscribe(),
             force_keyframe,
             target_bitrate_kbps,
-            quality.bitrate_kbps(),
+            max_kbps,
         ).await?;
         return Ok(());
     }
@@ -221,12 +230,15 @@ where
             tracing::warn!("WebRTC failed mid-stream, escalating to fallback relay");
             signaling.put_fallback(&session.id, &session.sender_token).await?;
             force_keyframe.store(true, Ordering::Relaxed);
+            let max_kbps = target_bitrate_kbps
+                .load(Ordering::Relaxed)
+                .max(quality.bitrate_kbps());
             fallback::run_sender(
                 backend, &session.id, &session.sender_token,
                 video_bcast.subscribe(), audio_bcast.subscribe(),
                 force_keyframe,
                 target_bitrate_kbps,
-                quality.bitrate_kbps(),
+                max_kbps,
             ).await?;
         }
         _ = video_pump_handle => {
@@ -325,6 +337,28 @@ fn start_video_pump(
                     );
                 }
                 continue;
+            }
+            // `Original` quality sizes its bitrate to the actual capture
+            // dimensions instead of using a fixed cap, because an 8 Mbps
+            // ceiling crushes a 4K/5K source into smear. We can only do
+            // this once a real frame is in hand, so the encoder thread
+            // publishes the dimension-sized target into the shared atomic
+            // on the first frame and whenever the source dimensions
+            // change (e.g. display reconfigured mid-share). The AIMD
+            // controller on the relay path is still free to adapt this
+            // downward between dim changes.
+            if matches!(quality, Quality::Original)
+                && (enc_w != frame.width || enc_h != frame.height)
+            {
+                let sized = quality.bitrate_kbps_for_capture(frame.width, frame.height);
+                let prev = target_bitrate_thread.swap(sized, Ordering::Relaxed);
+                if prev != sized {
+                    tracing::info!(
+                        w = frame.width, h = frame.height,
+                        prev_kbps = prev, sized_kbps = sized,
+                        "Original quality: sized bitrate to capture dimensions"
+                    );
+                }
             }
             let desired_bitrate = target_bitrate_thread.load(Ordering::Relaxed);
             // Skip the whole encode path when the captured frame is

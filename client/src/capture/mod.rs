@@ -111,7 +111,33 @@ impl Quality {
             Self::Low => 1_200,
             Self::Medium => 2_500,
             Self::High => 4_000,
+            // Floor for `Original`. The encoder thread upgrades the shared
+            // target via `bitrate_kbps_for_capture` once the first frame's
+            // real dimensions arrive; this value is what we use until then
+            // and as a lower bound thereafter.
             Self::Ultra | Self::Original => 8_000,
+        }
+    }
+    /// Target bitrate once the capture's real pixel dimensions are known.
+    /// Fixed presets ignore the dimensions; `Original` scales with them so
+    /// a 4K/5K display doesn't get crushed by the 8 Mbps starting floor.
+    ///
+    /// Sized at ~0.10 bits/pixel/second — a typical floor for low-motion
+    /// VP8 screen content. That gives ~6 Mbps for 1080p30 (matching
+    /// `High`), ~24 Mbps for 4K30, and ~44 Mbps for 5K30. Clamped to
+    /// `[bitrate_kbps(), 40_000]`: never below the static floor, capped so
+    /// a pathological multi-monitor desktop can't melt the encoder.
+    pub fn bitrate_kbps_for_capture(self, width: u32, height: u32) -> u32 {
+        match self {
+            Self::Original => {
+                const BITS_PER_PIXEL_PER_SECOND: f32 = 0.10;
+                let bps = width as f32
+                    * height as f32
+                    * self.fps() as f32
+                    * BITS_PER_PIXEL_PER_SECOND;
+                ((bps / 1000.0) as u32).clamp(self.bitrate_kbps(), 40_000)
+            }
+            _ => self.bitrate_kbps(),
         }
     }
     pub fn label(self) -> &'static str {
@@ -120,7 +146,7 @@ impl Quality {
             Self::Medium => "Medium (1080p · 24 fps · 2.5 Mbps)",
             Self::High => "High (1080p · 30 fps · 4 Mbps)",
             Self::Ultra => "Ultra (1080p · 60 fps · 8 Mbps)",
-            Self::Original => "Original (native · 30 fps · 8 Mbps)",
+            Self::Original => "Original (native · 30 fps · adaptive)",
         }
     }
 }
