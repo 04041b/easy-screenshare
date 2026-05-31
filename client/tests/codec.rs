@@ -1,10 +1,11 @@
-//! Integration tests for the BGRA→I420 converter and the I420 packer.
+//! Integration tests for the BGRA→I420 converter.
 //!
-//! Values target BT.601 limited-range coefficients, the same formulae used
-//! in `bgra_to_i420`. A ±2 tolerance covers integer-rounding drift between
-//! the canonical real-valued formulae and the integer pipeline.
+//! Values target BT.601 limited-range coefficients, the same matrix
+//! `bgra_to_i420_into` asks `yuvutils-rs` for. A ±2 tolerance covers
+//! integer-rounding drift between the canonical real-valued formulae and the
+//! SIMD integer pipeline (NEON / AVX2 / SSE4 dispatch under the hood).
 
-use screenshare::webrtc_client::codec::{bgra_to_i420, pack_i420};
+use screenshare::webrtc_client::codec::bgra_to_i420_into;
 
 /// Build a width×height BGRA buffer filled with a single (b, g, r, a) pixel.
 fn solid(width: u32, height: u32, b: u8, g: u8, r: u8) -> Vec<u8> {
@@ -42,54 +43,66 @@ fn assert_near(actual: u8, expected: u8, label: &str) {
     );
 }
 
+/// Run a conversion and return the (packed) buffer plus its plane slices.
+fn convert(bgra: &[u8], w: u32, h: u32, stride: u32) -> (Vec<u8>, std::ops::Range<usize>, std::ops::Range<usize>, std::ops::Range<usize>) {
+    let mut out = Vec::new();
+    bgra_to_i420_into(bgra, w, h, stride, &mut out).unwrap();
+    let y_end = (w * h) as usize;
+    let uv_size = ((w / 2) * (h / 2)) as usize;
+    (out, 0..y_end, y_end..y_end + uv_size, y_end + uv_size..y_end + 2 * uv_size)
+}
+
 #[test]
 fn bgra_white_maps_to_bt601_limited_white() {
-    let (y, u, v) = bgra_to_i420(&solid(2, 2, 255, 255, 255), 2, 2, 8).unwrap();
-    assert_near(y[0], 235, "Y(white)");
-    assert_near(u[0], 128, "U(white)");
-    assert_near(v[0], 128, "V(white)");
+    let (buf, y, u, v) = convert(&solid(2, 2, 255, 255, 255), 2, 2, 8);
+    assert_near(buf[y.start], 235, "Y(white)");
+    assert_near(buf[u.start], 128, "U(white)");
+    assert_near(buf[v.start], 128, "V(white)");
 }
 
 #[test]
 fn bgra_black_maps_to_bt601_limited_black() {
-    let (y, u, v) = bgra_to_i420(&solid(2, 2, 0, 0, 0), 2, 2, 8).unwrap();
-    assert_near(y[0], 16, "Y(black)");
-    assert_near(u[0], 128, "U(black)");
-    assert_near(v[0], 128, "V(black)");
+    let (buf, y, u, v) = convert(&solid(2, 2, 0, 0, 0), 2, 2, 8);
+    assert_near(buf[y.start], 16, "Y(black)");
+    assert_near(buf[u.start], 128, "U(black)");
+    assert_near(buf[v.start], 128, "V(black)");
 }
 
 #[test]
 fn bgra_pure_red() {
-    let (y, u, v) = bgra_to_i420(&solid(2, 2, 0, 0, 255), 2, 2, 8).unwrap();
-    assert_near(y[0], 81, "Y(red)");
-    assert_near(u[0], 90, "U(red)");
-    assert_near(v[0], 240, "V(red)");
+    let (buf, y, u, v) = convert(&solid(2, 2, 0, 0, 255), 2, 2, 8);
+    assert_near(buf[y.start], 81, "Y(red)");
+    assert_near(buf[u.start], 90, "U(red)");
+    assert_near(buf[v.start], 240, "V(red)");
 }
 
 #[test]
 fn bgra_pure_green() {
-    let (y, u, v) = bgra_to_i420(&solid(2, 2, 0, 255, 0), 2, 2, 8).unwrap();
-    assert_near(y[0], 145, "Y(green)");
-    assert_near(u[0], 54, "U(green)");
-    assert_near(v[0], 34, "V(green)");
+    let (buf, y, u, v) = convert(&solid(2, 2, 0, 255, 0), 2, 2, 8);
+    assert_near(buf[y.start], 145, "Y(green)");
+    assert_near(buf[u.start], 54, "U(green)");
+    assert_near(buf[v.start], 34, "V(green)");
 }
 
 #[test]
 fn bgra_pure_blue() {
-    let (y, u, v) = bgra_to_i420(&solid(2, 2, 255, 0, 0), 2, 2, 8).unwrap();
-    assert_near(y[0], 41, "Y(blue)");
-    assert_near(u[0], 240, "U(blue)");
-    assert_near(v[0], 110, "V(blue)");
+    let (buf, y, u, v) = convert(&solid(2, 2, 255, 0, 0), 2, 2, 8);
+    assert_near(buf[y.start], 41, "Y(blue)");
+    assert_near(buf[u.start], 240, "U(blue)");
+    assert_near(buf[v.start], 110, "V(blue)");
 }
 
 #[test]
-fn bgra_plane_sizes() {
+fn bgra_packed_buffer_sizes() {
     let w = 8u32;
     let h = 6u32;
-    let (y, u, v) = bgra_to_i420(&solid(w, h, 12, 34, 56), w, h, w * 4).unwrap();
-    assert_eq!(y.len(), (w * h) as usize);
-    assert_eq!(u.len(), ((w / 2) * (h / 2)) as usize);
-    assert_eq!(v.len(), ((w / 2) * (h / 2)) as usize);
+    let (buf, y, u, v) = convert(&solid(w, h, 12, 34, 56), w, h, w * 4);
+    let y_size = (w * h) as usize;
+    let uv_size = ((w / 2) * (h / 2)) as usize;
+    assert_eq!(y.len(), y_size);
+    assert_eq!(u.len(), uv_size);
+    assert_eq!(v.len(), uv_size);
+    assert_eq!(buf.len(), y_size + 2 * uv_size);
 }
 
 #[test]
@@ -97,18 +110,17 @@ fn bgra_stride_padding_matches_unpadded() {
     // Two 4x4 solid-red images: one tight, one with 8 extra bytes per row.
     let tight = solid(4, 4, 0, 0, 255);
     let padded = solid_padded(4, 4, 0, 0, 255, 8);
-    let (y1, u1, v1) = bgra_to_i420(&tight, 4, 4, 16).unwrap();
-    let (y2, u2, v2) = bgra_to_i420(&padded, 4, 4, 24).unwrap();
-    assert_eq!(y1, y2, "Y plane should be identical regardless of stride");
-    assert_eq!(u1, u2, "U plane should be identical regardless of stride");
-    assert_eq!(v1, v2, "V plane should be identical regardless of stride");
+    let (buf1, _, _, _) = convert(&tight, 4, 4, 16);
+    let (buf2, _, _, _) = convert(&padded, 4, 4, 24);
+    assert_eq!(buf1, buf2, "Packed I420 should be identical regardless of source stride");
 }
 
 #[test]
 fn bgra_odd_dimensions_error() {
     // 3x2 has odd width — I420 sub-sampling requires even dimensions.
     let buf = vec![0u8; 3 * 2 * 4];
-    let err = bgra_to_i420(&buf, 3, 2, 12).unwrap_err();
+    let mut out = Vec::new();
+    let err = bgra_to_i420_into(&buf, 3, 2, 12, &mut out).unwrap_err();
     assert!(
         err.to_string().contains("even"),
         "expected even-dimension error, got: {err}"
@@ -119,7 +131,8 @@ fn bgra_odd_dimensions_error() {
 fn bgra_too_small_buffer_error() {
     // Claim 4x4 with stride=16 (=> 64 bytes needed) but supply only 32.
     let buf = vec![0u8; 32];
-    let err = bgra_to_i420(&buf, 4, 4, 16).unwrap_err();
+    let mut out = Vec::new();
+    let err = bgra_to_i420_into(&buf, 4, 4, 16, &mut out).unwrap_err();
     assert!(
         err.to_string().contains("too small"),
         "expected too-small error, got: {err}"
@@ -127,21 +140,22 @@ fn bgra_too_small_buffer_error() {
 }
 
 #[test]
-fn pack_i420_length_is_sum() {
-    let y = vec![1u8; 16];
-    let u = vec![2u8; 4];
-    let v = vec![3u8; 4];
-    let packed = pack_i420(&y, &u, &v);
-    assert_eq!(packed.len(), y.len() + u.len() + v.len());
-}
+fn out_buffer_is_reused_in_place() {
+    // The hot-path contract: callers reuse `out` across frames so per-frame
+    // allocation cost is zero once it's sized. Calling twice in a row should
+    // leave `out` exactly the right size (resize on first call, untouched on
+    // second).
+    let w = 4u32;
+    let h = 4u32;
+    let bgra = solid(w, h, 0, 0, 255);
+    let expected_len = ((w * h) + 2 * (w / 2) * (h / 2)) as usize;
 
-#[test]
-fn pack_i420_order_is_y_then_u_then_v() {
-    let y = vec![0xAA; 4];
-    let u = vec![0xBB; 2];
-    let v = vec![0xCC; 2];
-    let packed = pack_i420(&y, &u, &v);
-    assert_eq!(&packed[..4], &y[..]);
-    assert_eq!(&packed[4..6], &u[..]);
-    assert_eq!(&packed[6..8], &v[..]);
+    let mut out = Vec::new();
+    bgra_to_i420_into(&bgra, w, h, w * 4, &mut out).unwrap();
+    assert_eq!(out.len(), expected_len);
+
+    let cap_after_first = out.capacity();
+    bgra_to_i420_into(&bgra, w, h, w * 4, &mut out).unwrap();
+    assert_eq!(out.len(), expected_len);
+    assert_eq!(out.capacity(), cap_after_first, "second call should not realloc");
 }
