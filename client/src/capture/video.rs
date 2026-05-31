@@ -192,8 +192,13 @@ impl VideoCapture {
 /// visual quality — screen content is mostly low-frequency (UI, text
 /// glyphs) so the artefacts are tolerable, and the VP8 encoder further
 /// smooths what's left.
-#[cfg(target_os = "windows")]
-fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+///
+/// Kept `pub` and platform-agnostic so the integration tests under
+/// `client/tests/` can exercise it on the macOS dev machine. The single
+/// caller (`windows_impl::Handler::on_frame_arrived`) is itself gated to
+/// Windows, so this remains dead code on every other platform.
+#[allow(dead_code)]
+pub fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     let stride_bytes = (src_w * 4) as usize;
     let dst_row_bytes = (dst_w * 4) as usize;
     let mut dst = vec![0u8; dst_row_bytes * dst_h as usize];

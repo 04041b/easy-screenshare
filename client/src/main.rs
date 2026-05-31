@@ -1,11 +1,5 @@
-mod app;
-mod capture;
-mod fallback;
-mod render;
-mod signaling;
-mod webrtc_client;
-
 use clap::{Parser, Subcommand};
+use screenshare::{app, capture, webrtc_client};
 
 const DEFAULT_BACKEND: &str = "https://screenshare-backend.04041b.workers.dev";
 

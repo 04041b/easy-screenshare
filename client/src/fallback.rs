@@ -377,7 +377,13 @@ fn set_send_buffer_cap(
     socket2::SockRef::from(tcp).set_send_buffer_size(bytes as usize)
 }
 
-fn frame_to_bytes(f: &EncodedFrame) -> Vec<u8> {
+/// Serialize an [`EncodedFrame`] into the wire format the relay path uses.
+///
+/// Layout (little-endian throughout): `[stream(1) | flags(1) | ts_us(8) | payload]`.
+/// `flags` is `1` for keyframes, `0` otherwise. The same parser runs in the
+/// browser viewer (see `backend/src/viewer_html.ts`), so the byte layout is
+/// load-bearing — covered by an integration test under `client/tests/`.
+pub fn frame_to_bytes(f: &EncodedFrame) -> Vec<u8> {
     let mut out = Vec::with_capacity(10 + f.data.len());
     out.push(f.stream);
     out.push(if f.keyframe { 1 } else { 0 });
@@ -386,7 +392,9 @@ fn frame_to_bytes(f: &EncodedFrame) -> Vec<u8> {
     out
 }
 
-fn parse_frame(b: &[u8]) -> Option<ParsedFrame> {
+/// Inverse of [`frame_to_bytes`]. Returns `None` for buffers shorter than
+/// the 10-byte header.
+pub fn parse_frame(b: &[u8]) -> Option<ParsedFrame> {
     if b.len() < 10 { return None; }
     let stream = b[0];
     let keyframe = b[1] & 1 == 1;
@@ -399,10 +407,9 @@ fn parse_frame(b: &[u8]) -> Option<ParsedFrame> {
     })
 }
 
-struct ParsedFrame {
-    stream: u8,
-    keyframe: bool,
-    #[allow(dead_code)]
-    timestamp_us: u64,
-    data: Vec<u8>,
+pub struct ParsedFrame {
+    pub stream: u8,
+    pub keyframe: bool,
+    pub timestamp_us: u64,
+    pub data: Vec<u8>,
 }

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Install-free screen sharing client with Cloudflare Worker backend"
 
+[lib]
+name = "screenshare"
+path = "src/lib.rs"
+
 [[bin]]
 name = "screenshare"
 path = "src/main.rs"
