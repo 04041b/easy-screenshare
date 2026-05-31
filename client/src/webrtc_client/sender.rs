@@ -19,7 +19,7 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
-use crate::capture::{lower_thread_priority_for_background_work, AudioCapture, Quality, VideoCapture};
+use crate::capture::{self, lower_thread_priority_for_background_work, AudioCapture, Quality, VideoCapture};
 use crate::fallback;
 use crate::signaling::SignalingClient;
 use crate::webrtc_client::{codec, STUN_SERVERS};
@@ -156,11 +156,16 @@ where
     pc.set_remote_description(RTCSessionDescription::answer(answer.sdp)?)
         .await?;
 
-    // 7. Start media pumps now — encoder threads write to tracks regardless of P2P state;
-    //    fallback path reuses the same encoded frames over WS if WebRTC fails.
+    // 7. Build capture once, then start the pumps. On macOS this is one
+    //    SCStream that emits both video and audio — fusing the captures
+    //    here means the pump functions don't each construct their own
+    //    capture, which would double-open the SCStream and double-prompt
+    //    for permission. Windows/Linux build independent captures inside
+    //    `start_av` and the call site is identical.
+    let (video_capture, audio_capture) = capture::start_av(quality)?;
     let (video_pump_handle, video_bcast, force_keyframe, target_bitrate_kbps) =
-        start_video_pump(video_track.clone(), quality)?;
-    let (audio_pump_handle, audio_bcast) = start_audio_pump(audio_track.clone())?;
+        start_video_pump(video_track.clone(), quality, video_capture)?;
+    let (audio_pump_handle, audio_bcast) = start_audio_pump(audio_track.clone(), audio_capture)?;
 
     // 8. Watch for connection result.
     // A working P2P path completes the DTLS handshake in well under 2s (LAN
@@ -241,13 +246,13 @@ where
 fn start_video_pump(
     track: Arc<TrackLocalStaticSample>,
     quality: Quality,
+    mut capture: VideoCapture,
 ) -> Result<(
     tokio::task::JoinHandle<()>,
     tokio::sync::broadcast::Sender<EncodedFrame>,
     Arc<AtomicBool>,
     Arc<AtomicU32>,
 )> {
-    let mut capture = VideoCapture::start(quality.fps(), quality.resolution())?;
     // Mutable target bitrate so the relay's congestion controller can adapt
     // it on the fly. The encoder thread reads this each loop iteration and
     // re-inits the libvpx encoder when it changes (vpx-encode 0.5.0 doesn't
@@ -429,8 +434,8 @@ fn start_video_pump(
 /// on an OS thread and forwards EncodedFrames to an async forwarder.
 fn start_audio_pump(
     track: Arc<TrackLocalStaticSample>,
+    mut capture: AudioCapture,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::broadcast::Sender<EncodedFrame>)> {
-    let mut capture = AudioCapture::start()?;
     let (bcast_tx, _) = tokio::sync::broadcast::channel::<EncodedFrame>(64);
     // Bounded for the same reason as the video pump (see start_video_pump).
     let (enc_tx, mut enc_rx) = tokio::sync::mpsc::channel::<EncodedFrame>(32);

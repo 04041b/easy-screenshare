@@ -1,21 +1,23 @@
+#[cfg(not(target_os = "macos"))]
 use anyhow::Result;
-#[cfg(not(target_os = "windows"))]
-use anyhow::Context;
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 use parking_lot::Mutex;
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 use scap::{
     capturer::{Capturer, Options},
     frame::Frame,
 };
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::thread;
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+#[cfg(not(target_os = "macos"))]
 use super::Resolution;
 
 /// One captured video frame in BGRA8 layout.
@@ -30,67 +32,60 @@ pub struct VideoFrame {
 
 pub struct VideoCapture {
     pub rx: mpsc::Receiver<VideoFrame>,
-    // Kept alive for the lifetime of the capture. On scap-backed builds it's
-    // the emitter thread's handle (the reader thread runs free-form and
-    // self-exits when the mpsc sender drops). On the windows-capture build
-    // it's the CaptureControl handle returned by start_free_threaded; the
-    // handler's on_frame_arrived stops the capture when its mpsc Sender goes.
-    #[cfg(not(target_os = "windows"))]
+    // Kept alive for the lifetime of the capture. Each platform parks its
+    // capture-thread / capture-session handle here so dropping the
+    // VideoCapture tears the platform-specific resources down.
+    #[cfg(target_os = "linux")]
     _join: thread::JoinHandle<()>,
     #[cfg(target_os = "windows")]
     _capture_control: windows_capture::capture::CaptureControl<
         windows_impl::Handler,
         anyhow::Error,
     >,
+    // The macOS SCStream is shared with the paired AudioCapture so the
+    // stream stays alive until both halves drop; see `macos_impl::start_av`.
+    #[cfg(target_os = "macos")]
+    pub(crate) _session: std::sync::Arc<macos_impl::MacAvSession>,
 }
 
 impl VideoCapture {
+    /// Direct constructor for Linux/Windows. macOS callers use
+    /// [`crate::capture::start_av`], which builds the video and audio
+    /// captures from a single SCStream — there's no standalone video-only
+    /// SCKit path here because the wrapper session is shared.
+    #[cfg(not(target_os = "macos"))]
     pub fn start(target_fps: u32, target_resolution: Resolution) -> Result<Self> {
         #[cfg(target_os = "windows")]
         {
             windows_impl::start(target_fps, target_resolution)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
         {
             Self::start_scap(target_fps, target_resolution)
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     fn start_scap(target_fps: u32, target_resolution: Resolution) -> Result<Self> {
         if !scap::is_supported() {
             anyhow::bail!("screen capture is not supported on this platform/version");
         }
         if !scap::has_permission() {
-            // Try to request — on macOS this opens System Settings if denied.
             if !scap::request_permission() {
                 anyhow::bail!("screen recording permission denied");
             }
         }
 
-        // Pre-flight the shareable content. On macOS, `has_permission()` can
-        // report a stale `true` (the TCC grant is keyed to the executable, so a
-        // rebuilt binary loses it even though a cached check says otherwise).
-        // In that state `SCShareableContent::current()` returns zero displays,
-        // and scap's `Capturer::new` does `.find(main_display).unwrap()` on the
-        // empty list — panicking deep inside the crate. Because the release
-        // profile sets `panic = "abort"`, that panic takes down the whole
-        // process, the relay/WebRTC WS closes, and the viewer sees a black
-        // screen. Convert that abort into an actionable error here, before scap
-        // can reach its unwrap.
+        // Pre-flight the shareable content. scap's `Capturer::new` does
+        // `.find(main_display).unwrap()` on the display list, so an empty
+        // list panics deep inside the crate — and since the release profile
+        // is `panic = "abort"`, that panic takes down the whole process.
+        // Convert it into an actionable error here.
         let display_count = scap::get_all_targets()
             .into_iter()
             .filter(|t| matches!(t, scap::Target::Display(_)))
             .count();
         if display_count == 0 {
-            #[cfg(target_os = "macos")]
-            anyhow::bail!(
-                "no capturable displays — macOS Screen Recording permission is not \
-                 effectively granted to this binary. Open System Settings ▸ Privacy & \
-                 Security ▸ Screen Recording, toggle this executable off then on (or \
-                 remove and re-add it), and relaunch."
-            );
-            #[cfg(not(target_os = "macos"))]
             anyhow::bail!("no capturable displays found — screen capture cannot start");
         }
 
@@ -98,9 +93,8 @@ impl VideoCapture {
 
         // Latest valid frame, shared between the scap reader thread (writer)
         // and the emitter thread (reader). When scap goes idle and starts
-        // emitting w=0/h=0 sentinels (idle screen, headless display, etc.),
-        // the emitter keeps publishing the last good frame at the target rate
-        // so the downstream encoder sees a steady stream.
+        // emitting w=0/h=0 sentinels, the emitter keeps publishing the last
+        // good frame at the target rate so the encoder sees a steady stream.
         let latest: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
 
         let latest_writer = latest.clone();
@@ -197,16 +191,13 @@ impl VideoCapture {
 /// scale output, so we shrink in software here. Chosen for speed over
 /// visual quality — screen content is mostly low-frequency (UI, text
 /// glyphs) so the artefacts are tolerable, and the VP8 encoder further
-/// smooths what's left. A box filter would be ~4× slower per pixel and
-/// we're already on the hot path at ~30 fps × multi-megapixel frames.
+/// smooths what's left.
 #[cfg(target_os = "windows")]
 fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     let stride_bytes = (src_w * 4) as usize;
     let dst_row_bytes = (dst_w * 4) as usize;
     let mut dst = vec![0u8; dst_row_bytes * dst_h as usize];
     for dy in 0..dst_h {
-        // Sample-center mapping: dst pixel center at (dy + 0.5) / dst_h of the
-        // source range; equivalent to ((dy * 2 + 1) * src_h) / (dst_h * 2).
         let sy = ((dy as u64 * 2 + 1) * src_h as u64) / (dst_h as u64 * 2);
         let src_row = sy as usize * stride_bytes;
         let dst_row = dy as usize * dst_row_bytes;
@@ -225,10 +216,6 @@ mod windows_impl {
     //! Windows screen capture via the `windows-capture` crate directly,
     //! bypassing scap (whose Windows wrapper silently ignored
     //! `output_resolution` and was version-pinned to an old release).
-    //!
-    //! The handler trait runs on a dedicated thread managed by
-    //! windows-capture; we push BGRA frames into the same `tokio::mpsc`
-    //! channel the scap path uses, so the rest of the pipeline is unchanged.
 
     use super::{downscale_bgra, Resolution, VideoCapture, VideoFrame};
     use anyhow::Result;
@@ -285,14 +272,9 @@ mod windows_impl {
             let ts_us = self.start.elapsed().as_micros() as u64;
             let target_width = self.target_width;
 
-            // Capture the decisions we want to make about logging up-front
-            // so we don't need to mutate self while the frame buffer is
-            // borrowing self.nopad_buf below.
             let was_first = !self.first_logged;
             let was_first_scaled = !self.scaled_log_done;
 
-            // VP8 requires even dimensions. windows-capture has no native
-            // output_resolution scaling, so we shrink in software here.
             let tw = target_width & !1;
             let th = if tw > 0 && w > 0 {
                 ((tw as u64 * h as u64 / w as u64) as u32) & !1
@@ -302,11 +284,6 @@ mod windows_impl {
             let should_scale =
                 tw > 0 && th > 0 && tw < w && th < h && tw >= 16 && th >= 16;
 
-            // Borrow scope: get the BGRA bytes via FrameBuffer, then either
-            // downscale into a fresh Vec or copy into one. The FrameBuffer
-            // and its returned slice both go out of scope at the end of the
-            // block, releasing the borrow on self.nopad_buf so we can mutate
-            // self.first_logged / scaled_log_done after.
             let (final_w, final_h, data): (u32, u32, Vec<u8>) = {
                 let mut fb = frame
                     .buffer()
@@ -341,9 +318,6 @@ mod windows_impl {
                 data,
                 timestamp_us: ts_us,
             };
-            // blocking_send back-pressures naturally: when the encoder is
-            // behind, the WGC thread stalls here, which makes WGC drop
-            // older frames internally rather than queueing them on us.
             if self.tx.blocking_send(vf).is_err() {
                 tracing::info!("video mpsc closed — stopping windows-capture");
                 control.stop();
@@ -363,10 +337,8 @@ mod windows_impl {
         let monitor = Monitor::primary()
             .map_err(|e| anyhow::anyhow!("get primary monitor: {e:?}"))?;
 
-        // MinimumUpdateInterval caps WGC's *own* delivery rate. We've been
-        // burning CPU+GPU bandwidth doing 60 fps GPU→CPU copies that the
-        // encoder threw away. Telling WGC the floor lets it skip the copy
-        // entirely between frames. Custom interval = 1 / target_fps.
+        // MinimumUpdateInterval caps WGC's own delivery rate so it can skip
+        // GPU→CPU copies between frames when the encoder is already saturating.
         let interval = Duration::from_micros(1_000_000 / target_fps.max(1) as u64);
 
         let settings = Settings::new(
@@ -379,7 +351,9 @@ mod windows_impl {
             ColorFormat::Bgra8,
             HandlerFlags {
                 tx,
-                target_width: target_resolution.width(),
+                // None (Resolution::Native) → 0, which the handler's
+                // should_scale check treats as "don't downscale".
+                target_width: target_resolution.width().unwrap_or(0),
             },
         );
 
@@ -390,5 +364,264 @@ mod windows_impl {
             rx,
             _capture_control: control,
         })
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub mod macos_impl {
+    //! macOS screen + system-audio capture via the `screencapturekit` crate
+    //! directly, replacing scap. One `SCStream` emits both video frames
+    //! (`SCStreamOutputType::Screen`) and system audio
+    //! (`SCStreamOutputType::Audio`). The stream is wrapped in
+    //! `Arc<MacAvSession>` and shared between the paired `VideoCapture` and
+    //! `AudioCapture` so the underlying stream stays alive until both halves
+    //! drop. `Drop` on the session calls `stop_capture` synchronously.
+    //!
+    //! The mac audio path here is the reason this entry point exists at all
+    //! — `cpal` can't tap the render-side audio engine on macOS, so the
+    //! previous build sent the microphone instead of system audio. SCKit
+    //! delivers exactly what's playing through the speakers via the same
+    //! stream as the video, which is the path Apple intends for screen-share.
+    use super::super::audio::{AudioCapture, AudioFrame};
+    use super::{VideoCapture, VideoFrame};
+    use crate::capture::Quality;
+    use anyhow::{Context, Result};
+    // screencapturekit 1.5.x exposes `image_buffer()` / `audio_buffer_list()`
+    // directly on `CMSampleBuffer` (no extension trait needed), and
+    // `CVPixelBufferLockFlags` lives in `screencapturekit::cv`.
+    use screencapturekit::cv::CVPixelBufferLockFlags;
+    use screencapturekit::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::mpsc;
+
+    /// Owns the `SCStream` so the same session can be shared by the paired
+    /// `VideoCapture` and `AudioCapture`. The last `Arc` drop tears the
+    /// stream down through `stop_capture`.
+    pub struct MacAvSession {
+        stream: SCStream,
+    }
+
+    impl Drop for MacAvSession {
+        fn drop(&mut self) {
+            // stop_capture blocks on a Swift completion. That's fine here:
+            // the only callers reach this via Drop on capture handles that
+            // are themselves dropped synchronously from the sender thread.
+            if let Err(e) = self.stream.stop_capture() {
+                tracing::warn!("SCStream stop failed: {e}");
+            } else {
+                tracing::info!("SCStream stopped cleanly");
+            }
+        }
+    }
+
+    pub fn start_av(quality: Quality) -> Result<(VideoCapture, AudioCapture)> {
+        // 1. Pick the primary display. `SCShareableContent::get()` is the
+        //    permission gate — it errors out if Screen Recording isn't
+        //    granted, which we surface verbatim so the GUI can show it.
+        let content = SCShareableContent::get()
+            .map_err(|e| anyhow::anyhow!("SCShareableContent::get: {e}"))?;
+        let displays = content.displays();
+        let display = displays
+            .into_iter()
+            .next()
+            .context("no capturable displays — open System Settings ▸ Privacy & Security ▸ Screen Recording, enable this binary, and relaunch")?;
+
+        let src_w = display.width().max(1);
+        let src_h = display.height().max(1);
+
+        // Derive height from the source's actual aspect so we don't squash.
+        // VP8 also requires even dimensions, so mask off the low bit.
+        // None (Resolution::Native) → use the display's own width.
+        let target_w = quality
+            .resolution()
+            .width()
+            .map(|w| w.min(src_w))
+            .unwrap_or(src_w);
+        let target_h = (target_w as u64 * src_h as u64 / src_w as u64) as u32;
+        let out_w = target_w & !1;
+        let out_h = target_h.max(2) & !1;
+
+        // 2. Build the filter (single display, no excluded windows) and the
+        //    capture configuration. captures_audio + sample_rate + channel_count
+        //    are macOS 13.0+ on SCKit — feature `macos_13_0` is enabled in
+        //    Cargo.toml so these methods are present.
+        let filter = SCContentFilter::create()
+            .with_display(&display)
+            .with_excluding_windows(&[])
+            .build();
+
+        let sample_rate: u32 = 48_000;
+        let channels: u16 = 2;
+
+        let config = SCStreamConfiguration::new()
+            .with_width(out_w)
+            .with_height(out_h)
+            .with_pixel_format(PixelFormat::BGRA)
+            .with_shows_cursor(true)
+            .with_minimum_frame_interval(&CMTime::new(1, quality.fps().max(1) as i32))
+            .with_captures_audio(true)
+            .with_sample_rate(sample_rate as i32)
+            .with_channel_count(channels as i32);
+
+        // 3. Channels and shared session state.
+        let (video_tx, video_rx) = mpsc::channel::<VideoFrame>(8);
+        let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(32);
+
+        let start = Instant::now();
+        let video_first = Arc::new(AtomicBool::new(false));
+        let audio_first = Arc::new(AtomicBool::new(false));
+
+        let mut stream = SCStream::new(&filter, &config);
+
+        // 4. Video output handler. Runs on an SCKit dispatch queue, NOT
+        //    a tokio worker — `blocking_send` here would deadlock the whole
+        //    GCD queue. Use `try_send` and drop frames when the encoder
+        //    can't keep up; the sender's drain-to-latest already absorbs
+        //    burst delivery in the same direction.
+        {
+            let video_tx = video_tx.clone();
+            let video_first = Arc::clone(&video_first);
+            stream.add_output_handler(
+                move |sample: CMSampleBuffer, of_type: SCStreamOutputType| {
+                    if of_type != SCStreamOutputType::Screen {
+                        return;
+                    }
+                    let Some(pixel_buffer) = sample.image_buffer() else {
+                        return;
+                    };
+                    let guard = match pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) {
+                        Ok(g) => g,
+                        Err(rc) => {
+                            tracing::warn!(rc, "CVPixelBuffer lock failed");
+                            return;
+                        }
+                    };
+                    let w = guard.width() as u32;
+                    let h = guard.height() as u32;
+                    let stride = guard.bytes_per_row();
+                    let raw = guard.as_slice();
+                    if w == 0 || h == 0 || raw.is_empty() {
+                        return;
+                    }
+
+                    // SCKit BGRA buffers are usually padded to a 64-byte row
+                    // alignment, so we always copy row-by-row to a tight Vec
+                    // — the encoder downstream expects stride == width*4.
+                    let row_bytes = (w * 4) as usize;
+                    let mut data = Vec::with_capacity(row_bytes * h as usize);
+                    if stride == row_bytes {
+                        data.extend_from_slice(&raw[..row_bytes * h as usize]);
+                    } else {
+                        for y in 0..h as usize {
+                            let off = y * stride;
+                            data.extend_from_slice(&raw[off..off + row_bytes]);
+                        }
+                    }
+                    drop(guard);
+
+                    if !video_first.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            w, h, stride, bytes = data.len(),
+                            "first BGRA frame from screencapturekit"
+                        );
+                    }
+
+                    let ts_us = start.elapsed().as_micros() as u64;
+                    let vf = VideoFrame {
+                        width: w,
+                        height: h,
+                        stride: w * 4,
+                        data,
+                        timestamp_us: ts_us,
+                    };
+                    let _ = video_tx.try_send(vf);
+                },
+                SCStreamOutputType::Screen,
+            );
+        }
+
+        // 5. Audio output handler — interleaved f32 stereo at 48 kHz.
+        //    SCKit hands us one AudioBuffer per CMSampleBuffer for
+        //    interleaved layouts; we copy its bytes into a Vec<f32> and
+        //    push it down the same kind of mpsc the cpal/wasapi paths use,
+        //    so the opus encoder downstream doesn't need a SCKit-specific
+        //    code path.
+        {
+            let audio_tx = audio_tx.clone();
+            let audio_first = Arc::clone(&audio_first);
+            stream.add_output_handler(
+                move |sample: CMSampleBuffer, of_type: SCStreamOutputType| {
+                    if of_type != SCStreamOutputType::Audio {
+                        return;
+                    }
+                    let Some(abl) = sample.audio_buffer_list() else {
+                        return;
+                    };
+                    // Concatenate every buffer. SCKit with channel_count=2
+                    // typically delivers a single interleaved buffer, but
+                    // we handle the planar shape too for robustness.
+                    let mut samples: Vec<f32> = Vec::new();
+                    for buf in abl.iter() {
+                        let bytes = buf.data();
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        samples.reserve(bytes.len() / 4);
+                        for chunk in bytes.chunks_exact(4) {
+                            samples.push(f32::from_ne_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ]));
+                        }
+                    }
+                    if samples.is_empty() {
+                        return;
+                    }
+                    if !audio_first.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            samples = samples.len(),
+                            sample_rate,
+                            channels,
+                            "first audio packet from screencapturekit"
+                        );
+                    }
+                    let ts_us = start.elapsed().as_micros() as u64;
+                    match audio_tx.try_send(AudioFrame {
+                        samples,
+                        channels,
+                        sample_rate,
+                        timestamp_us: ts_us,
+                    }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
+                },
+                SCStreamOutputType::Audio,
+            );
+        }
+
+        // 6. Start the stream (blocking; returns when SCKit's start completion
+        //    fires). Any error here means SCKit refused to start — usually
+        //    revoked permission or another process holding the display.
+        stream
+            .start_capture()
+            .map_err(|e| anyhow::anyhow!("SCStream start: {e}"))?;
+        tracing::info!(out_w, out_h, fps = quality.fps(), "SCStream started");
+
+        let session = Arc::new(MacAvSession { stream });
+
+        let video = VideoCapture {
+            rx: video_rx,
+            _session: Arc::clone(&session),
+        };
+        let audio = AudioCapture {
+            rx: audio_rx,
+            sample_rate,
+            channels,
+            _session: Arc::clone(&session),
+        };
+        Ok((video, audio))
     }
 }

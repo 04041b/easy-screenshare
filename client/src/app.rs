@@ -138,7 +138,7 @@ impl eframe::App for App {
                     egui::ComboBox::from_id_source("quality-picker")
                         .selected_text(next_quality.label())
                         .show_ui(ui, |ui| {
-                            for q in [Quality::Low, Quality::Medium, Quality::High] {
+                            for q in [Quality::Low, Quality::Medium, Quality::High, Quality::Ultra, Quality::Original] {
                                 ui.selectable_value(&mut next_quality, q, q.label());
                             }
                         });

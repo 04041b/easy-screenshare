@@ -61,8 +61,9 @@ fn main() -> anyhow::Result<()> {
 /// verified without standing up a viewer. Capture in `share` only starts after
 /// a viewer answers, which makes permission problems hard to diagnose.
 async fn probe_capture() -> anyhow::Result<()> {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
+        println!("capture backend     = scap (Linux)");
         println!("scap is_supported   = {}", scap::is_supported());
         println!("scap has_permission = {}", scap::has_permission());
         let displays = scap::get_all_targets()
@@ -71,14 +72,34 @@ async fn probe_capture() -> anyhow::Result<()> {
             .count();
         println!("capturable displays = {displays}");
     }
+    #[cfg(target_os = "macos")]
+    {
+        use screencapturekit::prelude::SCShareableContent;
+        println!("capture backend     = screencapturekit (direct, no scap)");
+        match SCShareableContent::get() {
+            Ok(content) => {
+                let displays = content.displays();
+                println!("capturable displays = {}", displays.len());
+            }
+            Err(e) => {
+                println!("SCShareableContent::get failed: {e}");
+                println!("(open System Settings ▸ Privacy & Security ▸ Screen Recording, enable this binary, relaunch)");
+            }
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         println!("capture backend     = windows-capture (direct, no scap)");
     }
 
-    let mut capture = capture::VideoCapture::start(30, capture::Resolution::P1080)?;
-    println!("VideoCapture::start ok — waiting up to 5s for the first frame...");
-    match tokio::time::timeout(std::time::Duration::from_secs(5), capture.rx.recv()).await {
+    // start_av builds the full capture session the share path uses, so
+    // any permission or device error surfaces here. Drop the audio rx —
+    // the probe is video-only — but keep the AudioCapture handle alive so
+    // the macOS SCStream isn't torn down by Arc-drop before the first
+    // video frame lands.
+    let (mut video, _audio_keep_alive) = capture::start_av(capture::Quality::default())?;
+    println!("capture::start_av ok — waiting up to 5s for the first frame...");
+    match tokio::time::timeout(std::time::Duration::from_secs(5), video.rx.recv()).await {
         Ok(Some(f)) => {
             println!("OK: first frame {}x{} stride={} ({} bytes)", f.width, f.height, f.stride, f.data.len());
             Ok(())

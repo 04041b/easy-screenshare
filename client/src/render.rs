@@ -186,28 +186,174 @@ pub async fn pump_vp8_track(
 }
 
 /// Thin wrapper around libvpx decode so we can swap implementations without
-/// touching call sites. Keeping it inline here to avoid an extra module.
+/// touching call sites. Kept inline here to avoid an extra module.
+///
+/// We call libvpx directly through `env-libvpx-sys` (re-exported as the
+/// `vpx_sys` crate) instead of pulling in the `vpx-decode` wrapper crate:
+/// the wrapper is barely maintained, our encoder already links libvpx, and
+/// the decode-side surface we need is ~4 FFI calls.
 mod vpx_decode_shim {
+    use std::os::raw::c_int;
+    use std::ptr;
+
     pub struct Decoder {
-        // For v1 this is a placeholder — the user is expected to wire a real
-        // VP8 decoder here. Options:
-        //   * `vpx-decode` crate (mirror of vpx-encode, less maintained)
-        //   * `dav1d`/`openh264` if we switch codecs
-        //   * `ffmpeg-next` for a one-stop solution
-        // The browser viewer is the recommended path; this stub keeps the
-        // native binary compiling and gives a clear extension point.
+        ctx: vpx_sys::vpx_codec_ctx_t,
+        // `ctx` is initialised once; we set this on first successful init so
+        // Drop knows whether to call `vpx_codec_destroy`. libvpx tolerates
+        // destroy on an uninit ctx but only because the zeroed `iface` short-
+        // circuits — relying on that is fragile, so we track it ourselves.
+        initialised: bool,
     }
+
+    // SAFETY: a libvpx decoder context is owned exclusively by this struct
+    // and only touched through `&mut self`. libvpx itself has no thread-local
+    // state for VP8 decode that would care which thread does the work.
+    unsafe impl Send for Decoder {}
+
     pub struct Decoded {
         pub width: u32,
         pub height: u32,
         pub rgba: Vec<u8>,
     }
+
     impl Decoder {
-        pub fn new() -> Self { Self {} }
-        pub fn decode(&mut self, _data: &[u8]) -> Option<Decoded> {
-            // Returning None means the viewer window stays on its
-            // "waiting for frames…" message. See module-level comment.
-            None
+        pub fn new() -> Self {
+            // Zero-init is fine — libvpx writes every field on a successful
+            // `vpx_codec_dec_init_ver`. We defer the actual init to the first
+            // decode call so we don't fight the borrow checker about taking
+            // `&mut ctx` from a partially constructed `Self`.
+            Self {
+                ctx: unsafe { std::mem::zeroed() },
+                initialised: false,
+            }
+        }
+
+        fn ensure_init(&mut self) -> bool {
+            if self.initialised {
+                return true;
+            }
+            // Single-threaded decode: the viewer is on a soft path (relay
+            // fallback or debug native window) and frames already arrive
+            // serialised. Multi-threaded VP8 decode adds latency at the
+            // resolutions we ship.
+            let cfg = vpx_sys::vpx_codec_dec_cfg_t {
+                threads: 1,
+                w: 0,
+                h: 0,
+            };
+            let rc = unsafe {
+                vpx_sys::vpx_codec_dec_init_ver(
+                    &mut self.ctx,
+                    vpx_sys::vpx_codec_vp8_dx(),
+                    &cfg,
+                    0,
+                    vpx_sys::VPX_DECODER_ABI_VERSION as c_int,
+                )
+            };
+            if rc != vpx_sys::vpx_codec_err_t::VPX_CODEC_OK {
+                tracing::error!(?rc, "vpx_codec_dec_init_ver failed");
+                return false;
+            }
+            self.initialised = true;
+            true
+        }
+
+        pub fn decode(&mut self, data: &[u8]) -> Option<Decoded> {
+            if data.is_empty() || !self.ensure_init() {
+                return None;
+            }
+            let rc = unsafe {
+                vpx_sys::vpx_codec_decode(
+                    &mut self.ctx,
+                    data.as_ptr(),
+                    data.len() as u32,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc != vpx_sys::vpx_codec_err_t::VPX_CODEC_OK {
+                // Pre-keyframe deltas hit this when the viewer joins mid-
+                // stream; logging every one drowns the console.
+                tracing::debug!(?rc, "vpx_codec_decode rejected packet");
+                return None;
+            }
+            // Drain queued frames and keep only the newest. libvpx can hand
+            // back more than one image per `decode` call (rare for VP8, but
+            // the API contract says iterate until null).
+            let mut iter: vpx_sys::vpx_codec_iter_t = ptr::null();
+            let mut latest_rgba: Option<Decoded> = None;
+            loop {
+                let img = unsafe { vpx_sys::vpx_codec_get_frame(&mut self.ctx, &mut iter) };
+                if img.is_null() {
+                    break;
+                }
+                // SAFETY: `img` is owned by libvpx and valid until the next
+                // decode call; we only read from it within this loop body.
+                latest_rgba = Some(unsafe { i420_image_to_rgba(&*img) });
+            }
+            latest_rgba
+        }
+    }
+
+    impl Drop for Decoder {
+        fn drop(&mut self) {
+            if self.initialised {
+                unsafe {
+                    vpx_sys::vpx_codec_destroy(&mut self.ctx);
+                }
+            }
+        }
+    }
+
+    /// I420 → RGBA8 with BT.601 limited-range coefficients. Inline integer
+    /// math (no extra crate): the native viewer is the debug path and a
+    /// 1080p frame is ~2M pixels — fast enough at egui's repaint cadence.
+    ///
+    /// `img.stride[i]` is per-plane and almost always larger than the plane
+    /// width — libvpx aligns rows for SIMD. We index by stride, not width.
+    unsafe fn i420_image_to_rgba(img: &vpx_sys::vpx_image_t) -> Decoded {
+        // We only ever ask VP8 for I420 output; guard so a future codec
+        // swap (VP9 profile 1 etc.) fails loudly instead of producing
+        // green frames.
+        debug_assert_eq!(img.fmt, vpx_sys::vpx_img_fmt::VPX_IMG_FMT_I420);
+
+        let w = img.d_w as usize;
+        let h = img.d_h as usize;
+        let y_plane = img.planes[vpx_sys::VPX_PLANE_Y as usize];
+        let u_plane = img.planes[vpx_sys::VPX_PLANE_U as usize];
+        let v_plane = img.planes[vpx_sys::VPX_PLANE_V as usize];
+        let y_stride = img.stride[vpx_sys::VPX_PLANE_Y as usize] as usize;
+        let u_stride = img.stride[vpx_sys::VPX_PLANE_U as usize] as usize;
+        let v_stride = img.stride[vpx_sys::VPX_PLANE_V as usize] as usize;
+
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let y_row = y_plane.add(y * y_stride);
+            let u_row = u_plane.add((y / 2) * u_stride);
+            let v_row = v_plane.add((y / 2) * v_stride);
+            let dst_row = rgba.as_mut_ptr().add(y * w * 4);
+            for x in 0..w {
+                // BT.601 limited-range YUV → RGB. Coefficients scaled by
+                // 1024 for integer math; saturating-cast handles overshoot
+                // at the colour-space corners.
+                let yv = *y_row.add(x) as i32 - 16;
+                let uv = *u_row.add(x / 2) as i32 - 128;
+                let vv = *v_row.add(x / 2) as i32 - 128;
+                let y298 = 298 * yv;
+                let r = (y298 + 409 * vv + 128) >> 8;
+                let g = (y298 - 100 * uv - 208 * vv + 128) >> 8;
+                let b = (y298 + 516 * uv + 128) >> 8;
+                let dst = dst_row.add(x * 4);
+                *dst = r.clamp(0, 255) as u8;
+                *dst.add(1) = g.clamp(0, 255) as u8;
+                *dst.add(2) = b.clamp(0, 255) as u8;
+                *dst.add(3) = 255;
+            }
+        }
+        Decoded {
+            width: w as u32,
+            height: h as u32,
+            rgba,
         }
     }
 }

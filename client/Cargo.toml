@@ -31,18 +31,23 @@ parking_lot = "0.12"
 bytes = "1"
 socket2 = "0.5"
 
-cpal = "0.15"
 webrtc = "0.11"
 vpx-encode = "0.5"
 env-libvpx-sys = { version = "5.1", features = ["generate"] }
 opus = "0.3"
 
-# scap covers screen capture on macOS and Linux. On Windows we go direct to
-# windows-capture — scap 0.0.8's Windows wrapper silently ignored
-# `output_resolution` (forcing client-side downscaling) and was pinned to an
-# old windows-capture release blocking us from upstream fixes.
-[target.'cfg(not(target_os = "windows"))'.dependencies]
+# Linux is the only target still routed through scap. macOS uses
+# `screencapturekit` directly; Windows uses `windows-capture` + `wasapi`
+# directly. scap 0.0.8 has produced a series of sharp-edged bugs (mac
+# empty-display-list panic, Windows resolution ignored, pinned to an old
+# windows-capture, deprecated `Capturer::new` with no working
+# replacement), so we've moved every platform off it that we ship in CI.
+# Linux stays on scap as a stopgap — CI doesn't build Linux artifacts.
+[target.'cfg(target_os = "linux")'.dependencies]
 scap = "0.0.8"
+# cpal handles audio capture on Linux (ALSA/PulseAudio). Windows uses
+# wasapi loopback directly; macOS pulls system audio from the SCStream.
+cpal = "0.15"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Going direct lets us track latest and gives us cleaner ownership over the
@@ -62,8 +67,21 @@ wasapi = "0.15"
 windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# scap already wraps ScreenCaptureKit including system audio on macOS 13+.
-# Keeping this section as a hook in case we need direct access later.
+# Direct ScreenCaptureKit bindings. Replaces scap on macOS — the same
+# stream emits both video frames and system audio via separate output
+# handlers, which closes the long-standing "macOS sender's audio is the
+# mic, not the speakers" gap (cpal couldn't tap render-side audio).
+#
+# Pinned to the 1.x series of `screencapturekit-rs` (last release: 1.5.4).
+# Versions 3.x and later switched to the doom-fish "apple suite" and pull
+# `apple-metal`, whose Swift bridge references macOS 26 SDK symbols
+# (`MTLSamplerReductionMode`, `reactiveMaskTexture`) that don't exist in
+# Xcode 15's macOS 14 SDK — including the macOS 14 runner CI uses, so
+# 3.x+ doesn't build for us at all. 1.x is the last upstream that still
+# compiles on Xcode 15.
+# macos_13_0 unlocks SCStreamConfiguration.set_captures_audio /
+# set_sample_rate / set_channel_count.
+screencapturekit = { version = "1.5", features = ["macos_13_0"] }
 
 [profile.release]
 opt-level = 3

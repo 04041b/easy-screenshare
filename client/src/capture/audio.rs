@@ -1,7 +1,8 @@
+#[cfg(not(target_os = "macos"))]
 use anyhow::Result;
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 use anyhow::Context;
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::sync::mpsc;
 
@@ -17,40 +18,45 @@ pub struct AudioCapture {
     pub rx: mpsc::Receiver<AudioFrame>,
     pub sample_rate: u32,
     pub channels: u16,
-    // On macOS/Linux we hold the cpal Stream to keep its callback thread alive.
+    // On Linux we hold the cpal Stream to keep its callback thread alive.
     // On Windows we manage the WASAPI loopback thread ourselves; it self-exits
-    // when the tokio mpsc Receiver is dropped (Sender::try_send returns Closed).
-    #[cfg(not(target_os = "windows"))]
+    // when the mpsc Receiver is dropped (Sender::try_send returns Closed).
+    // On macOS the audio frames come from the shared SCStream owned by
+    // `MacAvSession`; we hold a clone of that Arc here so the stream lives
+    // until both this capture and the paired VideoCapture drop.
+    #[cfg(target_os = "linux")]
     _stream: cpal::Stream,
+    #[cfg(target_os = "macos")]
+    pub(crate) _session: std::sync::Arc<super::video::macos_impl::MacAvSession>,
 }
 
 impl AudioCapture {
     /// Start capturing system / mic audio.
     ///
     /// Platform notes:
-    /// - macOS 13+: cpal cannot capture system audio directly. scap's
-    ///   ScreenCaptureKit backend can provide audio alongside video; for v1
-    ///   we capture mic input here and document the SCKit-audio integration as
-    ///   a follow-up.
-    /// - Windows: uses WASAPI loopback via the `wasapi` crate, which sets
-    ///   `AUDCLNT_STREAMFLAGS_LOOPBACK` for us when initializing a Render
-    ///   device in Capture direction. The previous cpal-based path opened the
-    ///   default output as an input but never set that flag, so callbacks
-    ///   never fired and the audio broadcast closed immediately.
+    /// - macOS: there is **no** standalone audio constructor — system
+    ///   audio is captured by the same `SCStream` as video. Use
+    ///   [`crate::capture::start_av`] instead, which returns the audio
+    ///   half alongside the video half.
+    /// - Windows: WASAPI loopback via the `wasapi` crate, which sets
+    ///   `AUDCLNT_STREAMFLAGS_LOOPBACK` when initialising a Render
+    ///   device in Capture direction. cpal opens the default output as
+    ///   an input but never sets that flag, so callbacks never fire.
     /// - Linux: requires a PulseAudio/PipeWire loopback (`pactl load-module
     ///   module-loopback`) and selecting the monitor source as default input.
+    #[cfg(not(target_os = "macos"))]
     pub fn start() -> Result<Self> {
         #[cfg(target_os = "windows")]
         {
             Self::start_wasapi_loopback()
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
         {
             Self::start_cpal()
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     fn start_cpal() -> Result<Self> {
         let host = cpal::default_host();
         let device = host
