@@ -130,6 +130,28 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
+      # Run the integration test suite under `client/tests/` on macOS only.
+      # The crate now exposes a `lib` target (see `src/lib.rs`) so pure
+      # functions — BGRA→I420 conversion, fallback wire format, capture
+      # preset math, signaling URL builder — can be exercised without
+      # touching real capture/audio hardware. Windows would re-run the same
+      # tests on the same target_os = "windows"-agnostic code, so we skip
+      # it here to keep the Windows job focused on producing the artifact.
+      - name: Test (release)
+        if: runner.os == 'macOS'
+        run: cargo test --release
+
+      # Clippy on the same macOS job. `continue-on-error: true` keeps it
+      # advisory for now — the existing codebase trips a handful of lints
+      # (too_many_arguments on the sender, type_complexity on a tuple
+      # return, manual_is_multiple_of, derivable_impls) that are out of
+      # scope for the test-foundation PR. Flip to enforcing once those are
+      # cleaned up.
+      - name: Clippy (release)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: cargo clippy --all-targets --release -- -D warnings
+
       - name: Stage artifact
         shell: bash
         run: |

@@ -1,3 +1,8 @@
+// TODO: this Worker has no test harness yet. Add vitest + miniflare so the
+// relay room state machine (config caching, viewer keyframe-on-join,
+// idle-timeout cleanup) gets unit coverage. Tracked alongside the first
+// Rust test landing in `client/tests/`.
+
 interface DOEnv {}
 
 const IDLE_TIMEOUT_MS = 60_000;
