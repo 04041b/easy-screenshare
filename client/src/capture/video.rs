@@ -396,6 +396,13 @@ pub mod macos_impl {
     use std::time::Instant;
     use tokio::sync::mpsc;
 
+    // CoreGraphics direct FFI for the one symbol we need; adding the whole
+    // `core-graphics` crate just to identify the main display would be a
+    // disproportionate dep. CGDirectDisplayID is a u32.
+    extern "C" {
+        fn CGMainDisplayID() -> u32;
+    }
+
     /// Owns the `SCStream` so the same session can be shared by the paired
     /// `VideoCapture` and `AudioCapture`. The last `Arc` drop tears the
     /// stream down through `stop_capture`.
@@ -423,9 +430,20 @@ pub mod macos_impl {
         let content = SCShareableContent::get()
             .map_err(|e| anyhow::anyhow!("SCShareableContent::get: {e}"))?;
         let displays = content.displays();
+        // `displays()` returns SCDisplays in CoreGraphics enumeration order,
+        // which is NOT guaranteed to put the main display first on a
+        // multi-monitor setup (the common MacBook + external monitor case).
+        // Match against CGMainDisplayID so the shared screen is the one with
+        // the menu bar; fall back to the first display only when the lookup
+        // misses (e.g. unusual list after a TCC permission flap).
+        let main_id = unsafe { CGMainDisplayID() };
+        let main_idx = displays
+            .iter()
+            .position(|d| d.display_id() == main_id)
+            .unwrap_or(0);
         let display = displays
             .into_iter()
-            .next()
+            .nth(main_idx)
             .context("no capturable displays — open System Settings ▸ Privacy & Security ▸ Screen Recording, enable this binary, and relaunch")?;
 
         let src_w = display.width().max(1);
@@ -542,12 +560,12 @@ pub mod macos_impl {
             );
         }
 
-        // 5. Audio output handler — interleaved f32 stereo at 48 kHz.
-        //    SCKit hands us one AudioBuffer per CMSampleBuffer for
-        //    interleaved layouts; we copy its bytes into a Vec<f32> and
-        //    push it down the same kind of mpsc the cpal/wasapi paths use,
-        //    so the opus encoder downstream doesn't need a SCKit-specific
-        //    code path.
+        // 5. Audio output handler — f32 stereo at 48 kHz.
+        //    SCKit delivers Float32 audio as a non-interleaved
+        //    AudioBufferList (one AudioBuffer per channel) by default. The
+        //    body of the handler interleaves into a single Vec<f32> so the
+        //    opus encoder downstream sees the same {L,R,L,R,…} layout the
+        //    cpal/wasapi paths produce.
         {
             let audio_tx = audio_tx.clone();
             let audio_first = Arc::clone(&audio_first);
@@ -559,22 +577,49 @@ pub mod macos_impl {
                     let Some(abl) = sample.audio_buffer_list() else {
                         return;
                     };
-                    // Concatenate every buffer. SCKit with channel_count=2
-                    // typically delivers a single interleaved buffer, but
-                    // we handle the planar shape too for robustness.
-                    let mut samples: Vec<f32> = Vec::new();
-                    for buf in abl.iter() {
-                        let bytes = buf.data();
-                        if bytes.is_empty() {
-                            continue;
-                        }
-                        samples.reserve(bytes.len() / 4);
-                        for chunk in bytes.chunks_exact(4) {
-                            samples.push(f32::from_ne_bytes([
-                                chunk[0], chunk[1], chunk[2], chunk[3],
-                            ]));
-                        }
+                    // SCKit Float32 stereo arrives as a non-interleaved
+                    // AudioBufferList by default: one AudioBuffer per channel
+                    // (kAudioFormatFlagIsNonInterleaved). If we concatenate
+                    // them end-to-end the downstream opus encoder gets all of
+                    // L followed by all of R within a single 20ms frame, which
+                    // sounds like garbled mono. Detect the planar layout
+                    // (> 1 non-empty buffer) and interleave by sample index.
+                    // A single-buffer ABL is already interleaved and we just
+                    // copy it through.
+                    let bufs: Vec<&[u8]> = abl
+                        .iter()
+                        .map(|b| b.data())
+                        .filter(|d| !d.is_empty())
+                        .collect();
+                    if bufs.is_empty() {
+                        return;
                     }
+                    let read_f32 = |bytes: &[u8], i: usize| -> f32 {
+                        let off = i * 4;
+                        f32::from_ne_bytes([
+                            bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3],
+                        ])
+                    };
+                    let samples: Vec<f32> = if bufs.len() == 1 {
+                        bufs[0]
+                            .chunks_exact(4)
+                            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    } else {
+                        // Planar: each buffer holds one channel. Walk by
+                        // sample index across all channels. Cap at the
+                        // shortest buffer in case SCKit ever hands us a
+                        // ragged ABL.
+                        let n_ch = bufs.len();
+                        let per_ch = bufs.iter().map(|b| b.len() / 4).min().unwrap_or(0);
+                        let mut out = Vec::with_capacity(per_ch * n_ch);
+                        for s in 0..per_ch {
+                            for ch in 0..n_ch {
+                                out.push(read_f32(bufs[ch], s));
+                            }
+                        }
+                        out
+                    };
                     if samples.is_empty() {
                         return;
                     }
