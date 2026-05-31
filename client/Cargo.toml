@@ -40,6 +40,15 @@ vpx-encode = "0.5"
 env-libvpx-sys = { version = "5.1", features = ["generate"] }
 opus = "0.3"
 
+# SIMD BGRA→I420. Pure Rust with NEON / AVX2 / SSE4 dispatch — replaces the
+# hand-rolled BT.601 loops in `codec::bgra_to_i420`, which were the biggest CPU
+# cost in the encoder thread (~5–15 ms per 1080p frame).
+yuvutils-rs = "0.8"
+# xxh3 hash for per-frame change detection. The encoder thread hashes the
+# captured BGRA buffer and skips the conversion + VP8 encode entirely when the
+# screen hasn't moved, which is most frames on a typical reading/editing screen.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
 # Linux is the only target still routed through scap. macOS uses
 # `screencapturekit` directly; Windows uses `windows-capture` + `wasapi`
 # directly. scap 0.0.8 has produced a series of sharp-edged bugs (mac

@@ -287,6 +287,16 @@ fn start_video_pump(
         let mut enc_bitrate_kbps: u32 = 0;
         let mut t0_us: Option<u64> = None;
         let mut frames_seen = 0u64;
+        // Reused across iterations so the bgra→i420 conversion doesn't
+        // allocate per frame. Sized on first use and resized only on
+        // dimension changes.
+        let mut i420_buf: Vec<u8> = Vec::new();
+        // Hash of the last captured BGRA buffer we actually encoded. Used to
+        // skip the color conversion + VP8 encode when the screen hasn't moved
+        // — by far the largest CPU cost on idle screens. xxh3 over a 1080p
+        // BGRA buffer is sub-ms with SIMD, so the overhead on active frames
+        // is negligible compared to what it saves.
+        let mut last_frame_hash: Option<u64> = None;
 
         while let Some(mut frame) = capture.rx.blocking_recv() {
             // Drain any frames that piled up while we were busy with the
@@ -317,6 +327,26 @@ fn start_video_pump(
                 continue;
             }
             let desired_bitrate = target_bitrate_thread.load(Ordering::Relaxed);
+            // Skip the whole encode path when the captured frame is
+            // byte-identical to the last one we encoded — typical on a
+            // static screen. We still must process if anything downstream
+            // is asking for a fresh frame (force_keyframe), a bitrate
+            // change pending re-init, or no encoder yet. Anything that
+            // makes the existing decoder state unusable for a new
+            // subscriber must NOT be elided.
+            let need_new_encoder = encoder.is_none()
+                || enc_w != frame.width
+                || enc_h != frame.height
+                || enc_bitrate_kbps != desired_bitrate;
+            let force_kf_pending = force_keyframe_thread.load(Ordering::Relaxed);
+            let frame_hash = xxhash_rust::xxh3::xxh3_64(&frame.data);
+            if !force_kf_pending
+                && !need_new_encoder
+                && last_frame_hash == Some(frame_hash)
+            {
+                continue;
+            }
+            last_frame_hash = Some(frame_hash);
             if force_keyframe_thread.swap(false, Ordering::Relaxed) {
                 tracing::info!(bitrate = desired_bitrate, "force_keyframe set — reinitialising encoder");
                 encoder = None;
@@ -372,18 +402,16 @@ fn start_video_pump(
                     }
                 }
             }
-            let (y, u, v) = match codec::bgra_to_i420(&frame.data, frame.width, frame.height, frame.stride) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("color conv failed: {e}");
-                    continue;
-                }
-            };
-            let i420 = codec::pack_i420(&y, &u, &v);
+            if let Err(e) = codec::bgra_to_i420_into(
+                &frame.data, frame.width, frame.height, frame.stride, &mut i420_buf,
+            ) {
+                tracing::warn!("color conv failed: {e}");
+                continue;
+            }
             let base = *t0_us.get_or_insert(frame.timestamp_us);
             let ts_ms = ((frame.timestamp_us - base) / 1000) as i64;
             let enc = encoder.as_mut().unwrap();
-            let packets = match enc.encode(ts_ms, &i420) {
+            let packets = match enc.encode(ts_ms, &i420_buf) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("encode err: {e}");
