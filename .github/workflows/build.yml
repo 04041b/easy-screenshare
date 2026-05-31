@@ -152,13 +152,29 @@ jobs:
         continue-on-error: true
         run: cargo clippy --all-targets --release -- -D warnings
 
-      - name: Stage artifact
+      # Stage two artifacts side-by-side: the raw executable (so a user can
+      # download and run with no unzip step) and a .zip wrapper (so the file
+      # survives transport channels that mangle bare binaries — Slack/email
+      # AV scans, Windows SmartScreen "Unknown publisher" prompts on raw
+      # .exe, etc.). Split by OS because Git Bash on the Windows runner
+      # has no `zip`; pwsh's Compress-Archive is the cross-runner equivalent.
+      - name: Stage artifact (macOS)
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           mkdir -p out
           cp "target/release/screenshare${{ matrix.ext }}" "out/screenshare-${{ matrix.label }}${{ matrix.ext }}"
           zip -j "out/screenshare-${{ matrix.label }}.zip" "target/release/screenshare${{ matrix.ext }}"
           ls -lh out/
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item "target/release/screenshare${{ matrix.ext }}" "out/screenshare-${{ matrix.label }}${{ matrix.ext }}"
+          Compress-Archive -Path "target/release/screenshare${{ matrix.ext }}" -DestinationPath "out/screenshare-${{ matrix.label }}.zip" -Force
+          Get-ChildItem out/ | Format-Table Name, Length
 
       - name: Upload binary
         # archive: false (upload-artifact v7+) skips the default zip wrap so
