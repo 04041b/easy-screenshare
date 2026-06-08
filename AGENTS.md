@@ -196,10 +196,16 @@ capturable, instead of letting scap abort.
 - **`panic = "abort"`** (release profile) means any panic on any thread kills
   the process. Prefer pre-flight checks that return `Result` over trusting
   third-party crates not to panic.
-- **bin-only crate.** `client/` has no `lib.rs`, so `run_sender`,
-  `start_video_pump`, `VideoCapture`, etc. are not importable from `tests/` or
-  `examples/`. This has repeatedly blocked clean regression tests. Consider
-  splitting into `lib.rs` + thin `main.rs` to get testable seams.
+- **Vendored `webrtc-dtls`.** `client/vendor/webrtc-dtls/` is a verbatim copy of
+  upstream 0.10.0 plus one ported fix from 0.12.0 in `flight0.rs`: pick the
+  first *supported* curve from the client's offer instead of blindly taking
+  `[0]`. Without this, modern Chrome/Firefox put PQC hybrid curves first, our
+  server selects `NamedCurve::Unsupported`, and DTLS later fails with
+  `ErrInvalidNamedCurve` — the long-standing "browser P2P falls back to relay"
+  symptom. Wired through `[patch.crates-io]` in `client/Cargo.toml`. When you
+  next bump `webrtc-rs`, check whether the new release transitively pulls
+  `webrtc-dtls >= 0.12` and, if so, drop the vendor + patch entirely. See
+  upstream issues webrtc-rs/webrtc#801 and #417.
 - **CI** (`.github/workflows/build.yml`) builds `macos-arm64` and `windows-x64`
   release binaries on every push to `main` and uploads them as artifacts
   (`screenshare-windows-x64`, etc., 14-day retention). Use this to hand the user
@@ -207,13 +213,6 @@ capturable, instead of letting scap abort.
 
 ## Known open issues (not yet fixed)
 
-- **WebRTC P2P fails against modern browsers.** `webrtc-rs` 0.11's DTLS stack
-  doesn't understand DTLS 1.3 extensions browsers offer (`Unsupported Extension
-  Type 51/43/45`, then `invalid named curve`), so P2P always falls back to the
-  relay for those clients. Fix needs a `webrtc-rs` upgrade that speaks DTLS 1.3,
-  or constraining the offer to DTLS 1.2 / a known curve.
-- **Audio over the relay** is effectively unused on machines without a capture
-  source; the relay now tolerates this. Real system-audio capture on macOS
-  needs a loopback device or ScreenCaptureKit audio wiring (follow-up).
-- **Backend relay diagnostics.** `relay_room.ts` still has `console.log` lines
-  from debugging; decide whether to keep or strip when you next touch it.
+_None currently outstanding. Recently closed: browser-P2P DTLS handshake (see
+"Vendored `webrtc-dtls`" under Gotchas); macOS system-audio capture (wired via
+shared `SCStream` in `MacAvSession`, see `capture/audio.rs`)._

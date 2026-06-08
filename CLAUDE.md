@@ -63,7 +63,7 @@ The user generally wants both client push *and* backend deploy when relay code c
 
 - `windows-capture = "=1.4.4"` — scap 0.0.8's Windows backend straddles two API eras of this crate; 1.4.4 is the only one that fits.
 - `vpx-encode = "0.5"` — sender.rs reaches through its struct layout to call `vpx_codec_control_(VP8E_SET_CPUUSED, 8)`. Changing the version may break that.
-- `webrtc = "0.11"` — known DTLS 1.3 issue against modern browsers; upgrade is the long-term fix but is a large change.
+- `webrtc = "0.11"` — its transitive `webrtc-dtls = "0.10"` is overridden by `client/vendor/webrtc-dtls/` (verbatim 0.10.0 + one ported curve-selection fix from 0.12.0). See AGENTS.md § Gotchas → "Vendored `webrtc-dtls`". When bumping `webrtc`, check whether the new release pulls `webrtc-dtls >= 0.12` and drop the vendor if so.
 
 ## Sandbox limitations
 

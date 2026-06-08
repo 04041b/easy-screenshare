@@ -102,3 +102,16 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Override the transitively-pinned webrtc-dtls 0.10.0 with a local vendored copy
+# carrying a single ported fix from upstream 0.12.0 (`flight0.rs`: pick the first
+# *supported* curve from the client's offer instead of blindly taking [0]).
+# Without this patch, modern Chrome/Firefox put PQC hybrid curves first, our
+# server selects NamedCurve::Unsupported, and the DTLS handshake fails later
+# with ErrInvalidNamedCurve — breaking all browser-viewer P2P (issue
+# webrtc-rs/webrtc#801, also #417). webrtc 0.11's SettingEngine offers no knob
+# to influence this from app code, and bumping webrtc-rs is currently a large
+# change to a pre-release. See vendor/webrtc-dtls/src/flight/flight0.rs for the
+# patched block.
+[patch.crates-io]
+webrtc-dtls = { path = "vendor/webrtc-dtls" }
