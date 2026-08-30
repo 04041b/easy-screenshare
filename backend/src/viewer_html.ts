@@ -257,119 +257,190 @@ export const VIEWER_HTML = `<!doctype html>
   }
 
   function startWsFallback() {
-    setStatus('falling back to relay…');
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // PIN goes in the URL query because WS upgrades can't carry custom headers
-    const ws = new WebSocket(proto + '//' + location.host + '/ws/relay/' + ID + '?role=viewer&pin=' + encodeURIComponent(PIN));
-    ws.binaryType = 'arraybuffer';
-    setDbg('ws', 'connecting');
-    ws.addEventListener('open', () => setDbg('ws', 'open'));
-
     video.hidden = true;
     canvas.hidden = false;
     const ctx = canvas.getContext('2d');
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = proto + '//' + location.host + '/ws/relay/' + ID + '?role=viewer&pin=' + encodeURIComponent(PIN);
 
-    let vdec = null, adec = null;
-    let actx = null;
-    let nextAudioTime = 0;
-    // VP8 P-frames can't be decoded without a preceding keyframe — feeding
-    // one to a freshly-configured VideoDecoder throws "a key frame is
-    // required after configure() or flush()" and corrupts the decoder for
-    // the rest of the session. Gate decode until we see the first keyframe,
-    // and ask the relay (which asks the sender) to produce one.
-    let seenKeyframe = false;
+    // ---- Reconnect state ----
+    let backoffMs = 1000;          // current backoff delay (doubles up to 8s)
+    const BACKOFF_CAP = 8000;
+    const RETRY_DEADLINE_MS = 5 * 60 * 1000; // give up after 5 minutes of retrying
+    let retryStart = 0;           // timestamp of first retry in current sequence
+    let reconnects = 0;           // total reconnect attempts (for debug overlay)
+    let stopped = false;          // true once we decide not to retry
 
-    ws.addEventListener('message', async (ev) => {
-      if (typeof ev.data === 'string') {
-        const cfg = JSON.parse(ev.data);
-        if (cfg.v !== 1) return;
-        vdec = new VideoDecoder({
-          output: (frame) => {
-            if (canvas.width !== frame.displayWidth) {
-              canvas.width = frame.displayWidth;
-              canvas.height = frame.displayHeight;
-            }
-            ctx.drawImage(frame, 0, 0);
-            frame.close();
-          },
-          error: (e) => { console.error('video decoder', e); setDbg('vdec', 'err: ' + e.message); },
-        });
-        try { vdec.configure({ codec: cfg.codec || 'vp8' }); setDbg('vdec', vdec.state); }
-        catch (e) { setDbg('vdec', 'cfg fail: ' + e.message); }
+    function connectWs() {
+      if (stopped) return;
 
-        if (cfg.audio) {
-          actx = new AudioContext({ sampleRate: cfg.audio.rate });
-          adec = new AudioDecoder({
-            output: (data) => {
-              const buf = actx.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate);
-              for (let ch = 0; ch < data.numberOfChannels; ch++) {
-                const arr = new Float32Array(data.numberOfFrames);
-                data.copyTo(arr, { planeIndex: ch, format: 'f32-planar' });
-                buf.copyToChannel(arr, ch);
+      setStatus(reconnects === 0 ? 'falling back to relay…' : 'reconnecting… (' + reconnects + ')');
+      setDbg('ws', reconnects === 0 ? 'connecting' : 'reconnecting #' + reconnects);
+
+      const ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+
+      // Decoder state — reset on every connection so the fresh DO
+      // connection triggers a new keyframe and RelayConfig replay.
+      let vdec = null, adec = null;
+      let actx = null;
+      let nextAudioTime = 0;
+      let seenKeyframe = false;
+      let gotData = false;  // true once we receive any message (resets backoff)
+
+      ws.addEventListener('open', () => {
+        setDbg('ws', 'open');
+        // Reset backoff on successful open — the connection is alive.
+        backoffMs = 1000;
+        retryStart = 0;
+      });
+
+      ws.addEventListener('message', async (ev) => {
+        if (!gotData) { gotData = true; }
+
+        if (typeof ev.data === 'string') {
+          const cfg = JSON.parse(ev.data);
+          if (cfg.v !== 1) return;
+          // Close previous decoders if they exist (reconnect path).
+          if (vdec && vdec.state !== 'closed') { try { vdec.close(); } catch {} }
+          if (adec && adec.state !== 'closed') { try { adec.close(); } catch {} }
+          vdec = new VideoDecoder({
+            output: (frame) => {
+              if (canvas.width !== frame.displayWidth) {
+                canvas.width = frame.displayWidth;
+                canvas.height = frame.displayHeight;
               }
-              const src = actx.createBufferSource();
-              src.buffer = buf;
-              src.connect(actx.destination);
-              const now = actx.currentTime;
-              if (nextAudioTime < now) nextAudioTime = now;
-              src.start(nextAudioTime);
-              nextAudioTime += buf.duration;
-              data.close();
+              ctx.drawImage(frame, 0, 0);
+              frame.close();
             },
-            error: (e) => { console.error('audio decoder', e); setDbg('adec', 'err: ' + e.message); },
+            error: (e) => { console.error('video decoder', e); setDbg('vdec', 'err: ' + e.message); },
           });
-          try {
-            adec.configure({ codec: cfg.audio.codec || 'opus', sampleRate: cfg.audio.rate, numberOfChannels: cfg.audio.channels });
-            setDbg('adec', adec.state);
-          } catch (e) { setDbg('adec', 'cfg fail: ' + e.message); }
+          try { vdec.configure({ codec: cfg.codec || 'vp8' }); setDbg('vdec', vdec.state); }
+          catch (e) { setDbg('vdec', 'cfg fail: ' + e.message); }
+
+          if (cfg.audio) {
+            if (!actx) actx = new AudioContext({ sampleRate: cfg.audio.rate });
+            nextAudioTime = 0;
+            adec = new AudioDecoder({
+              output: (data) => {
+                const buf = actx.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate);
+                for (let ch = 0; ch < data.numberOfChannels; ch++) {
+                  const arr = new Float32Array(data.numberOfFrames);
+                  data.copyTo(arr, { planeIndex: ch, format: 'f32-planar' });
+                  buf.copyToChannel(arr, ch);
+                }
+                const src = actx.createBufferSource();
+                src.buffer = buf;
+                src.connect(actx.destination);
+                const now = actx.currentTime;
+                if (nextAudioTime < now) nextAudioTime = now;
+                src.start(nextAudioTime);
+                nextAudioTime += buf.duration;
+                data.close();
+              },
+              error: (e) => { console.error('audio decoder', e); setDbg('adec', 'err: ' + e.message); },
+            });
+            try {
+              adec.configure({ codec: cfg.audio.codec || 'opus', sampleRate: cfg.audio.rate, numberOfChannels: cfg.audio.channels });
+              setDbg('adec', adec.state);
+            } catch (e) { setDbg('adec', 'cfg fail: ' + e.message); }
+          }
+          setStatus(reconnects > 0 ? 'reconnected' : 'relay active', 2000);
+          return;
         }
-        setStatus('relay active', 2000);
+
+        const buf = ev.data;
+        if (buf.byteLength < 10) return;
+        const dv = new DataView(buf);
+        const stream = dv.getUint8(0);
+        const flags = dv.getUint8(1);
+        const ts = Number(dv.getBigUint64(2, true));
+        const payload = new Uint8Array(buf, 10);
+        if (stream === 0 && vdec && vdec.state === 'configured') {
+          const isKey = (flags & 1) === 1;
+          if (!seenKeyframe) {
+            if (!isKey) {
+              // Drop silently until the first keyframe lands. The DO will have
+              // asked the sender for one on viewer-join; meanwhile we don't
+              // want to push a delta into the decoder.
+              return;
+            }
+            seenKeyframe = true;
+            setDbg('vdec', 'configured (key seen)');
+          }
+          dbgState.wsFramesV++;
+          setDbg('wsf', dbgState.wsFramesV + '/' + dbgState.wsFramesA);
+          try {
+            vdec.decode(new EncodedVideoChunk({
+              type: isKey ? 'key' : 'delta',
+              timestamp: ts,
+              data: payload,
+            }));
+          } catch (e) { setDbg('vdec', 'decode err: ' + e.message); }
+        } else if (stream === 1 && adec && adec.state === 'configured') {
+          dbgState.wsFramesA++;
+          setDbg('wsf', dbgState.wsFramesV + '/' + dbgState.wsFramesA);
+          try {
+            adec.decode(new EncodedAudioChunk({
+              type: 'key',
+              timestamp: ts,
+              data: payload,
+            }));
+          } catch (e) { setDbg('adec', 'decode err: ' + e.message); }
+        }
+      });
+
+      ws.addEventListener('close', (e) => {
+        setDbg('ws', 'closed ' + e.code);
+
+        // Clean up decoders so they don't leak on reconnect.
+        if (vdec && vdec.state !== 'closed') { try { vdec.close(); } catch {} }
+        if (adec && adec.state !== 'closed') { try { adec.close(); } catch {} }
+
+        // Code 1001 = "sender disconnected" (DO cascading close) — the share
+        // is intentionally over, don't retry.
+        if (e.code === 1001) {
+          setStatus('sender disconnected');
+          stopped = true;
+          return;
+        }
+        // Code 1000 = normal close — also intentional, don't retry.
+        if (e.code === 1000) {
+          setStatus('relay closed');
+          stopped = true;
+          return;
+        }
+
+        // Everything else (4001 "no sender", 1006 abnormal, network errors)
+        // is potentially recoverable — retry with backoff.
+        scheduleRetry();
+      });
+
+      ws.addEventListener('error', () => {
+        setDbg('ws', 'error');
+        // The close event always fires after error, which handles retry.
+      });
+    }
+
+    function scheduleRetry() {
+      if (stopped) return;
+      const now = Date.now();
+      if (!retryStart) retryStart = now;
+      if (now - retryStart > RETRY_DEADLINE_MS) {
+        setStatus('could not reconnect');
+        setDbg('ws', 'gave up after 5m');
+        stopped = true;
         return;
       }
+      reconnects++;
+      setStatus('reconnecting in ' + (backoffMs / 1000) + 's…');
+      setDbg('ws', 'retry #' + reconnects + ' in ' + backoffMs + 'ms');
+      setTimeout(connectWs, backoffMs);
+      backoffMs = Math.min(backoffMs * 2, BACKOFF_CAP);
+    }
 
-      const buf = ev.data;
-      if (buf.byteLength < 10) return;
-      const dv = new DataView(buf);
-      const stream = dv.getUint8(0);
-      const flags = dv.getUint8(1);
-      const ts = Number(dv.getBigUint64(2, true));
-      const payload = new Uint8Array(buf, 10);
-      if (stream === 0 && vdec && vdec.state === 'configured') {
-        const isKey = (flags & 1) === 1;
-        if (!seenKeyframe) {
-          if (!isKey) {
-            // Drop silently until the first keyframe lands. The DO will have
-            // asked the sender for one on viewer-join; meanwhile we don't
-            // want to push a delta into the decoder.
-            return;
-          }
-          seenKeyframe = true;
-          setDbg('vdec', 'configured (key seen)');
-        }
-        dbgState.wsFramesV++;
-        setDbg('wsf', dbgState.wsFramesV + '/' + dbgState.wsFramesA);
-        try {
-          vdec.decode(new EncodedVideoChunk({
-            type: isKey ? 'key' : 'delta',
-            timestamp: ts,
-            data: payload,
-          }));
-        } catch (e) { setDbg('vdec', 'decode err: ' + e.message); }
-      } else if (stream === 1 && adec && adec.state === 'configured') {
-        dbgState.wsFramesA++;
-        setDbg('wsf', dbgState.wsFramesV + '/' + dbgState.wsFramesA);
-        try {
-          adec.decode(new EncodedAudioChunk({
-            type: 'key',
-            timestamp: ts,
-            data: payload,
-          }));
-        } catch (e) { setDbg('adec', 'decode err: ' + e.message); }
-      }
-    });
-
-    ws.addEventListener('close', (e) => { setStatus('relay closed'); setDbg('ws', 'closed ' + e.code); });
-    ws.addEventListener('error', () => { setStatus('relay error'); setDbg('ws', 'error'); });
+    // Kick off the first connection.
+    connectWs();
   }
 })();
 </script>

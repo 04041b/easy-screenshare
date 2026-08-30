@@ -119,6 +119,16 @@ impl SignalingClient {
             .await?;
         Ok(f.fallback)
     }
+
+    pub async fn heartbeat(&self, id: &str, token: &str) -> anyhow::Result<()> {
+        self.http
+            .put(format!("{}/api/sessions/{}/heartbeat", self.base, id))
+            .header("X-Sender-Token", token)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
 }
 
 /// Build the WS relay URL.

@@ -165,7 +165,7 @@ export default {
     }
 
     // /api/sessions/:id/<sub>
-    const apiMatch = path.match(/^\/api\/sessions\/([A-Z0-9]{8})\/(offer|answer|fallback)$/);
+    const apiMatch = path.match(/^\/api\/sessions\/([A-Z0-9]{8})\/(offer|answer|fallback|heartbeat)$/);
     if (apiMatch) {
       const [, id, sub] = apiMatch;
       if (!isValidId(id)) return err(400, "invalid session id");
@@ -233,6 +233,19 @@ export default {
         }
         if (method === "GET") {
           return json({ fallback: session.fallback === 1 });
+        }
+      }
+
+      if (sub === "heartbeat") {
+        if (method === "PUT") {
+          const auth = requireSenderToken(request, session);
+          if (auth) return auth;
+          const newExpiry = Date.now() + SESSION_TTL_MS;
+          await env.SIGNAL_DB
+            .prepare("UPDATE sessions SET expires_at = ? WHERE id = ?")
+            .bind(newExpiry, id)
+            .run();
+          return json({ ok: true, expires_at: newExpiry });
         }
       }
 

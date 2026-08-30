@@ -55,6 +55,35 @@ where
     });
     tracing::info!(id = %session.id, "session created");
 
+    // Session heartbeat — extend TTL every 10 minutes so long-running
+    // shares don't hard-expire at 30 minutes. Non-fatal: a single missed
+    // heartbeat still leaves 20 minutes of runway.
+    let heartbeat_handle = {
+        let hb_signaling = SignalingClient::new(backend);
+        let hb_id = session.id.clone();
+        let hb_token = session.sender_token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
+            interval.tick().await; // first tick fires immediately, skip it
+            loop {
+                interval.tick().await;
+                match hb_signaling.heartbeat(&hb_id, &hb_token).await {
+                    Ok(()) => tracing::info!("session heartbeat sent — TTL extended"),
+                    Err(e) => tracing::warn!("session heartbeat failed: {e}"),
+                }
+            }
+        })
+    };
+
+    // Cancel heartbeat when the sender exits.
+    struct HeartbeatGuard(tokio::task::JoinHandle<()>);
+    impl Drop for HeartbeatGuard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _heartbeat_guard = HeartbeatGuard(heartbeat_handle);
+
     // 2. Build PeerConnection
     let mut media = MediaEngine::default();
     media.register_default_codecs()?;
