@@ -94,15 +94,21 @@ async function getSession(db: D1Database, id: string): Promise<SessionRow | null
 
 function requireSenderToken(req: Request, session: SessionRow): Response | null {
   const token = req.headers.get("X-Sender-Token");
-  if (!token || token !== session.sender_token) return err(401, "invalid sender token");
+  if (!token || !constantTimeEqual(token, session.sender_token)) return err(401, "invalid sender token");
   return null;
 }
 
 /**
  * Validate the viewer PIN from the X-Viewer-Pin header (or `?pin=` query
- * param, used by WS upgrades that can't set custom headers). On failure
- * increments the session's pin_fails; at PIN_FAIL_LIMIT the session is
- * locked and all further attempts return 423 until it expires.
+ * param, used by WS upgrades that can't set custom headers). At
+ * PIN_FAIL_LIMIT failures the session is locked and all further attempts
+ * return 423 until it expires.
+ *
+ * Each attempt atomically *reserves* a failure slot before comparing, and
+ * gives it back only if the PIN was right. Checking `session.pin_fails`
+ * from the earlier SELECT and incrementing afterwards would let N parallel
+ * guesses all observe the same pre-increment count, so a burst of requests
+ * could test far more than PIN_FAIL_LIMIT PINs.
  */
 async function requireViewerPin(
   db: D1Database,
@@ -110,20 +116,28 @@ async function requireViewerPin(
   url: URL,
   session: SessionRow,
 ): Promise<Response | null> {
-  if (session.pin_fails >= PIN_FAIL_LIMIT) {
-    return err(423, "session locked due to too many failed PIN attempts");
-  }
+  const locked = () => err(423, "session locked due to too many failed PIN attempts");
+  if (session.pin_fails >= PIN_FAIL_LIMIT) return locked();
   const pin = req.headers.get("X-Viewer-Pin") ?? url.searchParams.get("pin") ?? "";
   if (!/^\d{6}$/.test(pin)) return err(401, "PIN required (6 digits)");
+
+  const reserved = await db
+    .prepare(
+      "UPDATE sessions SET pin_fails = pin_fails + 1 WHERE id = ? AND pin_fails < ? RETURNING pin_fails",
+    )
+    .bind(session.id, PIN_FAIL_LIMIT)
+    .first<{ pin_fails: number }>();
+  if (!reserved) return locked();
+
   const candidate = await hashPin(pin, session.pin_salt);
   if (!constantTimeEqual(candidate, session.pin_hash)) {
-    await db
-      .prepare("UPDATE sessions SET pin_fails = pin_fails + 1 WHERE id = ?")
-      .bind(session.id)
-      .run();
-    const remaining = Math.max(0, PIN_FAIL_LIMIT - session.pin_fails - 1);
+    const remaining = Math.max(0, PIN_FAIL_LIMIT - reserved.pin_fails);
     return err(401, `invalid PIN (${remaining} attempts remaining)`);
   }
+  await db
+    .prepare("UPDATE sessions SET pin_fails = pin_fails - 1 WHERE id = ? AND pin_fails > 0")
+    .bind(session.id)
+    .run();
   return null;
 }
 
@@ -277,7 +291,7 @@ export default {
 
       if (role === "sender") {
         const token = url.searchParams.get("token");
-        if (token !== session.sender_token) return err(401, "invalid sender token");
+        if (!token || !constantTimeEqual(token, session.sender_token)) return err(401, "invalid sender token");
       } else {
         const pinErr = await requireViewerPin(env.SIGNAL_DB, request, url, session);
         if (pinErr) return pinErr;
