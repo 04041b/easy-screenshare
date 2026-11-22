@@ -14,15 +14,17 @@ When asked to fix a bug, scan the "Bugs resolved" section in `AGENTS.md` first �
 The cargo project root is `client/`, not the repo root. Most cargo commands need to be run from there:
 
 ```bash
-cd /Users/planet/claude/code/screenshare/client
+cd client
 cargo check --release         # not from screenshare/ — there's no top-level Cargo.toml
 ```
 
 For backend work:
 ```bash
-cd /Users/planet/claude/code/screenshare/backend
+cd backend
 npx wrangler tail --format pretty   # live logs from the deployed Worker
 npx wrangler deploy                  # production deploy
+npm run typecheck                    # tsc --noEmit
+npm run db:migrate                   # apply backend/migrations/ to the remote D1
 ```
 
 ## What CI does (and how to wait on it)
@@ -45,9 +47,9 @@ Single-purpose commits with a short imperative subject and a few-sentence body e
 - `Client: AIMD bandwidth estimator + frame pacing on relay path`
 - `Relay: keyframe on viewer join; viewer gates decode`
 
-Always include this trailer:
+Always include a `Co-Authored-By:` trailer naming the Claude model that wrote the commit, e.g.:
 ```
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 ```
 
 User flow for shipping changes during a session:
@@ -61,7 +63,7 @@ The user generally wants both client push *and* backend deploy when relay code c
 
 ## Pinned things, don't bump without asking
 
-- `windows-capture = "=1.4.4"` — scap 0.0.8's Windows backend straddles two API eras of this crate; 1.4.4 is the only one that fits.
+- `screencapturekit = "1.5"` — 3.x+ pulls `apple-metal`, which needs the macOS 26 SDK and doesn't build on the macOS 14 CI runner. See the comment in `client/Cargo.toml`.
 - `vpx-encode = "0.5"` — sender.rs reaches through its struct layout to call `vpx_codec_control_(VP8E_SET_CPUUSED, 8)`. Changing the version may break that.
 - `webrtc = "0.11"` — its transitive `webrtc-dtls = "0.10"` is overridden by `client/vendor/webrtc-dtls/` (verbatim 0.10.0 + one ported curve-selection fix from 0.12.0). See AGENTS.md § Gotchas → "Vendored `webrtc-dtls`". When bumping `webrtc`, check whether the new release pulls `webrtc-dtls >= 0.12` and drop the vendor if so.
 

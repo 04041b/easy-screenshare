@@ -2,7 +2,7 @@
 
 Install-free screen sharing. Native sender (Rust + egui, single binary), zero-install browser viewer, signaling and relay via a Cloudflare Worker with D1 + a single Durable Object.
 
-The sender tries WebRTC P2P first; if it can't establish in 4 seconds (which is common against browsers because `webrtc-rs` 0.11's DTLS stack doesn't understand DTLS 1.3) it escalates to a WebSocket relay through the Durable Object. The relay path runs an AIMD bandwidth controller so it adapts to the actual uplink instead of pushing blind.
+The sender tries WebRTC P2P first; if it can't establish in 4 seconds (typically a restrictive NAT, since there's no TURN server) it escalates to a WebSocket relay through the Durable Object. The relay path runs an AIMD bandwidth controller so it adapts to the actual uplink instead of pushing blind.
 
 ## Architecture
 
@@ -16,7 +16,7 @@ sender ──HTTPS──▶ Worker ◀──HTTPS── viewer (browser/native)
    └────────── WebRTC P2P (STUN) ────────┘
 ```
 
-- **Sender** (`client/`): Rust binary. Captures screen via `scap` and audio via `cpal` (macOS/Linux) or `wasapi` loopback (Windows). VP8 video via libvpx in realtime mode (`cpu_used=8`); Opus audio. Encoded frames fan out to both a WebRTC track and a `tokio::sync::broadcast` channel that the relay path reads from.
+- **Sender** (`client/`): Rust binary. Captures screen + system audio via ScreenCaptureKit on macOS, `windows-capture` + `wasapi` loopback on Windows, and `scap` + `cpal` on Linux. VP8 video via libvpx in realtime mode (`cpu_used=8`); Opus audio. Encoded frames fan out to both a WebRTC track and a `tokio::sync::broadcast` channel that the relay path reads from.
 - **Backend** (`backend/`): Cloudflare Worker (TypeScript). D1 holds the SDP offer/answer for non-trickle ICE signaling and a "fallback engaged" flag. A `RelayRoom` Durable Object accepts the sender + viewers as WebSockets and forwards encoded frames as binary messages.
 - **Viewer**: a browser tab served at `/viewer/:id` (WebCodecs decoder) or the same Rust binary in `view` mode (still useful for debugging; native VP8 decode is wire-up only).
 
@@ -29,6 +29,8 @@ The sender's GUI picker (or `Quality::default()` for headless) selects an encodi
 | Low    | 720p  | 15 | 1.2 Mbps |
 | Medium | 1080p | 24 | 2.5 Mbps |
 | High   | 1080p | 30 | 4 Mbps (default) |
+| Ultra  | 1080p | 60 | 8 Mbps |
+| Original | native | 30 | scales with capture size (8–40 Mbps) |
 
 Pick **Low** if you're on a slow uplink or sharing while gaming. Pick **High** for screen detail on a healthy link.
 
@@ -38,7 +40,7 @@ Pick **Low** if you're on a slow uplink or sharing while gaming. Pick **High** f
 cd backend
 npm install
 wrangler d1 create screenshare-signals   # paste returned id into wrangler.toml
-npm run db:migrate:local
+npm run db:migrate:local                 # applies migrations/ (use db:migrate for remote)
 npm run dev                              # local dev server
 npx wrangler deploy                      # production
 npx wrangler tail --format pretty        # live logs
@@ -60,15 +62,15 @@ The compiled-in backend default is production (`screenshare-backend.04041b.worke
 
 ### macOS permission gotcha
 
-Screen Recording permission is keyed to the executable's code hash. Every `cargo build` invalidates the grant for `target/release/screenshare` and `scap::has_permission()` keeps reporting a stale `true`. If capture suddenly fails after a rebuild, re-add the binary in System Settings ▸ Privacy & Security ▸ Screen Recording. `screenshare probe` is the fastest way to confirm.
+Screen Recording permission is keyed to the executable's code hash. Every `cargo build` invalidates the grant for `target/release/screenshare` and the OS can keep reporting a stale "granted". If capture suddenly fails after a rebuild, re-add the binary in System Settings ▸ Privacy & Security ▸ Screen Recording. `screenshare probe` is the fastest way to confirm.
 
 ## What works on what platform
 
 | Feature | macOS | Windows | Linux |
 |---|---|---|---|
-| Screen capture | ✓ (ScreenCaptureKit via scap) | ✓ (windows-capture via scap, native-res — we downscale in client) | ✓ (X11/Wayland via scap) |
-| System audio capture | ✗ (cpal mic only — SCKit audio is a follow-up) | ✓ (WASAPI loopback via the `wasapi` crate) | ✗ (needs PulseAudio loopback) |
-| WebRTC P2P to browser | ✓ (DTLS 1.2 ok) | ✗ (DTLS 1.3 mismatch — falls back to relay) | ✓ |
+| Screen capture | ✓ (ScreenCaptureKit, direct) | ✓ (`windows-capture`, direct; native-res — we downscale in client) | ✓ (X11/Wayland via scap) |
+| System audio capture | ✓ (same `SCStream` as video) | ✓ (WASAPI loopback via the `wasapi` crate) | ✗ (needs PulseAudio loopback) |
+| WebRTC P2P to browser | ✓ (vendored `webrtc-dtls` curve fix) | ✓ (same fix; not yet verified end-to-end on Windows) | ✓ |
 | WS relay path | ✓ | ✓ | ✓ |
 
 ## Status

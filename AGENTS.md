@@ -29,13 +29,14 @@ Key client files:
   frame-age dropping (100ms threshold), goodput meter, and AIMD bitrate
   controller. Also parses `{"v":1,"cmd":"keyframe"}` text messages from the DO
   and flips `force_keyframe` accordingly.
-- `client/src/capture/video.rs` — scap reader + emitter, plus in-process BGRA
-  downscale to the requested `Resolution` because scap's Windows backend
-  silently ignores its own `output_resolution` option.
-- `client/src/capture/audio.rs` — cpal mic on macOS/Linux, WASAPI loopback on
-  Windows (via the `wasapi` crate). All Windows COM init happens on the worker
+- `client/src/capture/video.rs` — per-platform capture: ScreenCaptureKit on
+  macOS, `windows-capture` on Windows, scap on Linux. Includes in-process
+  BGRA downscale to the requested `Resolution` (originally added because
+  scap's Windows backend ignored its own `output_resolution` option).
+- `client/src/capture/audio.rs` — system audio from the shared `SCStream` on
+  macOS, cpal on Linux, WASAPI loopback on Windows (via the `wasapi` crate). All Windows COM init happens on the worker
   thread because the WASAPI handle types are `!Send`.
-- `client/src/capture/mod.rs` — the `Quality` enum (Low/Medium/High), and the
+- `client/src/capture/mod.rs` — the `Quality` enum (Low/Medium/High/Ultra/Original), and the
   `lower_thread_priority_for_background_work()` helper used by the capture
   reader/emitter and the VP8 encoder threads on Windows to keep games at
   scheduler priority.
