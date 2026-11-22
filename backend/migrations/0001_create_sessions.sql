@@ -1,8 +1,8 @@
--- v2: add PIN gate columns (pin_salt, pin_hash, pin_fails). Early-stage
--- project: dropping and recreating is fine. If you've previously run
--- db:migrate:local, re-run it to pick up the new columns.
-DROP TABLE IF EXISTS sessions;
-CREATE TABLE sessions (
+-- Sessions table (signaling + PIN gate). Uses IF NOT EXISTS so this applies
+-- cleanly to the production DB, which was created from the old schema.sql
+-- before migrations were tracked. Future schema changes go in new numbered
+-- files: `npx wrangler d1 migrations create screenshare-signals <name>`.
+CREATE TABLE IF NOT EXISTS sessions (
   id            TEXT PRIMARY KEY,
   sender_token  TEXT NOT NULL,
   pin_salt      TEXT NOT NULL,
