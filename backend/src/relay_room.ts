@@ -6,10 +6,16 @@
 interface DOEnv {}
 
 const IDLE_TIMEOUT_MS = 60_000;
+// Minimum gap between alarm reschedules from the message path. setAlarm is a
+// storage write; doing it per binary frame meant ~30 writes/s per session.
+const ALARM_BUMP_INTERVAL_MS = 15_000;
 const CONFIG_KEY = "lastConfig";
 
 export class RelayRoom {
   state: DurableObjectState;
+  // In-memory only: resets to 0 when the DO hibernates, which just means the
+  // next message after waking bumps the alarm unconditionally.
+  private lastAlarmBump = 0;
 
   constructor(state: DurableObjectState, _env: DOEnv) {
     this.state = state;
@@ -82,7 +88,9 @@ export class RelayRoom {
     for (const v of viewers) {
       try { v.send(message); } catch {}
     }
-    await this.bumpIdleAlarm();
+    if (Date.now() - this.lastAlarmBump >= ALARM_BUMP_INTERVAL_MS) {
+      await this.bumpIdleAlarm();
+    }
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string, _wasClean: boolean): Promise<void> {
@@ -127,6 +135,7 @@ export class RelayRoom {
   }
 
   private async bumpIdleAlarm(): Promise<void> {
+    this.lastAlarmBump = Date.now();
     await this.state.storage.setAlarm(Date.now() + IDLE_TIMEOUT_MS);
   }
 }
