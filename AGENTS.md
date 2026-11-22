@@ -191,7 +191,7 @@ capturable, instead of letting scap abort.
 - **macOS TCC is per-binary.** Screen Recording permission is keyed to the
   executable's code hash. **Every `cargo build` invalidates the grant** for
   `target/release/screenshare`, so capture silently breaks after a rebuild and
-  `scap::has_permission()` can still report a stale `true`. If a user "granted
+  the OS can still report permission as granted. If a user "granted
   permission" but capture fails, suspect a rebuild since. Use `screenshare
   probe` to confirm. Long-term fix would be a stable code-signing identity.
 - **`panic = "abort"`** (release profile) means any panic on any thread kills
